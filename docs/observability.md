@@ -70,7 +70,7 @@ the fixed names below; free text belongs in `message`.
 | Condition | `True` means | `False` or `Unknown` reasons |
 |---|---|---|
 | `Ready` | The expected members are ready, no bootstrap is in progress, and no more than one master is observed | `InstancesNotReady`, `BootstrapRecoveryInProgress`, `RecoverySeedingReplicas`, `MultiplePrimariesObserved` |
-| `PrimaryResolved` | All members observed freshly, exactly one master (`SinglePrimaryObserved`) | `NoPrimaryObserved`, `MultiplePrimariesObserved`, `PrimaryObservationIncomplete`, `AmbiguousPrimaryObservation`; `Unknown` with `RolesNotObserved` |
+| `PrimaryResolved` | All members observed freshly, exactly one master (`SinglePrimaryObserved`) | `NoPrimaryObserved`, `MultiplePrimariesObserved`, `PrimaryObservationIncomplete`, `AmbiguousPrimaryObservation`, `InstanceManagerTokenRefused` (a member refused the cluster's token; it is no evidence, as an unreachable member); `Unknown` with `RolesNotObserved` |
 | `HAReady` | `PrimaryResolved` is `True` | the reason of `PrimaryResolved`; `HADisabled`; `Unknown` with `RoleDiscoveryDisabled` or `RolesNotObserved` |
 | `ReplicationHealthy` | Every observed slave applies (`AppliersProgressing`) | `ReplicationStalled`, `ApplyFailures`; `Unknown` with `ReplicationNotObserved` or `RolesNotObserved` |
 | `BrokerReady` | A Broker of each access mode is available | `BrokersNotAvailable`, `BrokerReconcileFailed` |
@@ -166,6 +166,7 @@ underscores.
 |---|---|---|---|
 | `status.currentPrimary` changes from one member to another | `PrimaryChanged` | Normal | `primary_changed` |
 | `PrimaryResolved` becomes `False` | `PrimaryUnresolved`, with the Condition's reason in the message | Warning | `primary_unresolved` |
+| `PrimaryResolved` takes the reason `InstanceManagerTokenRefused` (when it was `True`, also `PrimaryUnresolved`) | `InstanceManagerTokenRefused`, naming the members, never the token | Warning | `instance_manager_token_refused` |
 | `PrimaryResolved` becomes `True` again | `PrimaryResolved` | Normal | `primary_resolved` |
 | `ReplicationHealthy` becomes `False` | `ReplicationStalled` or `ApplyFailures` | Warning | `replication_stalled`, `apply_failures` |
 | `ReplicationHealthy` becomes `True` again | `ReplicationRecovered` | Normal | `replication_recovered` |
