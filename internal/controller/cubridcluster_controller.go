@@ -918,6 +918,11 @@ func (r *CubridClusterReconciler) updateStatus(ctx context.Context, cluster *dat
 	if !cluster.Spec.HighAvailability.Enabled {
 		setCondition(cluster, conditionHAReady, metav1.ConditionFalse, "HADisabled",
 			"highAvailability.enabled is false")
+		// The member has no HA role, but it reports its engine version, and
+		// the same guard as for an HA cluster applies to it (ADR-0009).
+		if r.Prober != nil {
+			r.reconcileStandaloneUpdate(ctx, cluster, sts, desired)
+		}
 	} else if r.Prober == nil {
 		setCondition(cluster, conditionHAReady, metav1.ConditionUnknown, "RoleDiscoveryDisabled",
 			"no role prober configured")
@@ -950,9 +955,15 @@ func (r *CubridClusterReconciler) updateStatus(ctx context.Context, cluster *dat
 	// An image the spec asks for but nobody accepted is reported last, so that
 	// it is what the Updating condition says.
 	if running, desired := runningImage(sts), r.instanceImage(cluster); running != "" && running != desired {
-		setCondition(cluster, conditionUpdating, metav1.ConditionFalse, "ImageChangeNotAccepted",
+		setCondition(cluster, conditionUpdating, metav1.ConditionFalse, reasonImageChangeNotAccepted,
 			"the spec asks for image "+desired+"; the Pods keep "+running+" until the new image is accepted with the annotation "+
 				acceptImageAnnotation+": "+desired)
+	} else if updating := meta.FindStatusCondition(cluster.Status.Conditions, conditionUpdating); updating != nil &&
+		updating.Reason == reasonImageChangeNotAccepted {
+		// The Pod template carries the image the spec asks for, and no step
+		// of this reconcile said anything else about the update: the held
+		// image is no longer pending.
+		meta.RemoveStatusCondition(&cluster.Status.Conditions, conditionUpdating)
 	}
 	if updating := meta.FindStatusCondition(cluster.Status.Conditions, conditionUpdating); updating != nil &&
 		updatingBefore != nil && updating.Status == updatingBefore.Status {
@@ -969,6 +980,12 @@ func (r *CubridClusterReconciler) updateStatus(ctx context.Context, cluster *dat
 	// for a master and a slave alike, so no event would bring the new roles in.
 	if cluster.Spec.HighAvailability.Enabled && r.Prober != nil {
 		return ctrl.Result{RequeueAfter: haResyncInterval}, nil
+	}
+	// A standalone member is not observed periodically (#155), but a member
+	// whose engine version is not known yet is asked again: otherwise an idle
+	// cluster stays blocked until an unrelated event.
+	if r.standaloneVersionPending(cluster) {
+		return ctrl.Result{RequeueAfter: standaloneVersionRetryInterval}, nil
 	}
 	return ctrl.Result{}, nil
 }
