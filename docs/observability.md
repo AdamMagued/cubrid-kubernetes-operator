@@ -162,7 +162,7 @@ An HA cluster with role discovery publishes when its HA status was observed:
 | Field | Meaning |
 |---|---|
 | `status.lastObservedTime` | When the Operator last asked every member for its role: the observation that `currentPrimary`, `instances[]` and `PrimaryResolved`, `HAReady` and `ReplicationHealthy` were derived from |
-| `status.instances[].lastObservedTime` | The time of the observation in which that member last gave a reachable answer to the role query, whatever role it reported; the same value as `status.lastObservedTime` for a member that answered in that observation |
+| `status.instances[].lastObservedTime` | The time of the observation in which that member last gave a reachable answer to the role query, whatever role it reported, that did not contradict itself or name another member; the same value as `status.lastObservedTime` for a member that answered in that observation |
 | `status.instances[].replication.observedAt` | When the slave's applier counters were last read |
 
 - **The times only move forward, and are not written on every pass.** The

@@ -254,9 +254,12 @@ func instanceStatuses(members []string, obs map[string]RoleObservation, now time
 		lastObserved := answered[m].DeepCopy()
 		if o, ok := obs[m]; ok && fresh(o, now) {
 			version = o.EngineVersion
-			// The pass's time, which the cluster's lastObservedTime is set
-			// to, not the prober's stamp: an equal time means the member
-			// answered in that pass.
+		}
+		// The pass's time, which the cluster's lastObservedTime is set to,
+		// not the prober's stamp: an equal time means the member answered in
+		// that pass. An answer that contradicts itself or names another
+		// member is not counted as this member's answer.
+		if o, ok := obs[m]; ok && fresh(o, now) && !o.Conflicting {
 			at := metav1.NewTime(now)
 			lastObserved = &at
 		}

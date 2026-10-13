@@ -214,6 +214,13 @@ func TestInstanceStatuses_LastObservedTimeIsThePass(t *testing.T) {
 	if at := got[1].LastObservedTime; at == nil || !at.Time.Equal(earlier.Time) {
 		t.Errorf("member that did not answer: lastObservedTime = %v, want %v", at, earlier)
 	}
+
+	// An answer that contradicts itself or names another member is no
+	// answer of this member: its time is kept.
+	obs[c1] = conflicting(slave())
+	if at := instanceStatuses(members, obs, testNow, previous)[1].LastObservedTime; at == nil || !at.Time.Equal(earlier.Time) {
+		t.Errorf("member with a conflicting answer: lastObservedTime = %v, want %v", at, earlier)
+	}
 }
 
 // A stored observation time is kept only while nothing else changes, it is

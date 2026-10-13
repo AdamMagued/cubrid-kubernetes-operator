@@ -756,10 +756,11 @@ spec:
                     lastObservedTime:
                       description: |-
                         lastObservedTime is the time of the observation in which this member
-                        last gave the operator a reachable answer to its role query, whatever
-                        role it reported: the cluster's lastObservedTime when it answered in
-                        that observation. A member that does not answer keeps the time of its
-                        last answer. A newer value of this time alone is written at most every
+                        last gave the operator a reachable answer to its role query that did not
+                        contradict itself or name another member, whatever role it reported: the
+                        cluster's lastObservedTime when it answered in that observation. A
+                        member that does not answer, or answers so, keeps the time of its last
+                        answer. A newer value of this time alone is written at most every
                         30 seconds, so it can understate the last answer by up to that much
                         (docs/observability.md, "Freshness").
                       format: date-time
