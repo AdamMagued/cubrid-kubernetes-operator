@@ -240,6 +240,19 @@ underscores.
 | A CubridBackup reaches a phase: `Pending`, `Running`, `Uploading`, `Completed`, `Failed` | on the CubridBackup: `BackupPending`, `BackupStarted`, `BackupUploading`, `BackupCompleted`, `BackupFailed` | Normal; `BackupFailed` is a Warning | `backup_pending`, `backup_started`, `backup_uploading`, `backup_completed`, `backup_failed` |
 | A recovery bootstrap takes a step: a restore operation is started (once for each attempt), restoredb begins after the download, the recovery ends | `RestoreStarted`, `RestoreRunning`, `RestoreCompleted`, `RestoreFailed` | Normal; `RestoreFailed` is a Warning | `restore_started`, `restore_running`, `restore_completed`, `restore_failed` |
 
+The `BackupFailed` Event carries the message of the CubridBackup's `Ready`
+condition. A backup whose start was not confirmed within 30 minutes
+(ADR-0007: from `status.targetRecordedAt`, or for `ObjectStorageWaitExpired`
+from `status.objectStorageNotAppliedSince`, which restarts whenever the
+backup goes back to waiting for a safe target) ends with one of these
+`Ready` reasons:
+
+| Reason | Meaning | What to do |
+|---|---|---|
+| `RecordedTargetNotStarted` | The recorded target answered that it holds no operation of the backup | Nothing runs; create a new CubridBackup |
+| `RecordedTargetUnverified` | The recorded target could not be asked whether it holds the operation, including when its operation store holds any record it cannot read (the lookup answers 500) | A backup may still run on the member named in the message; check it (`GET /v1/operations?idempotencyKey=`) before relying on the backup's prefix |
+| `ObjectStorageWaitExpired` | No target was recorded: the selected Pod did not run with the cluster's `spec.objectStorage` | Nothing was started; restart the Pod with the cluster's settings and create a new CubridBackup |
+
 An Event is a notice, not the record. The Operator sends at most 100 Events
 about one object in a row, and the allowance comes back at one Event in ten
 seconds; an Event beyond it is dropped, and nothing reports the drop. Kubernetes

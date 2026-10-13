@@ -115,6 +115,40 @@ resolved primary, and `unknown` the only member of a single-instance cluster.
 Otherwise the backup stays `Pending` with reason `RecordedTargetNotEligible`
 and no other member is started (#288).
 
+The wait on a recorded target is bounded (#365). With the target the
+operator records `status.targetRecordedAt`, in the same status write and
+before the call; a target recorded by an earlier operator without it is
+given the time it is first seen, so the wait is never cut short. While the
+recorded target is not eligible, or the cluster no longer has
+`spec.objectStorage` (reason `ObjectStorageNotConfigured`), the operator does
+not send the start to it; it asks it, with `GET /v1/operations?idempotencyKey=<key>` (ADR-0003), which
+only reads the operation store, whether it holds the backup's operation. An
+operation it holds is recorded in `status.operationRef` and polled to its
+end like any other. A start the target answers 409 (its store holds the
+key for another request body, or another operation runs on the database)
+is followed by the same lookup at once. Thirty minutes after `targetRecordedAt` without a known
+operation, whatever kept the start from being taken (an ineligible target,
+an unreachable manager, a 412 or a 409), the start is not sent again and the
+target is asked once more. An operation it holds is followed; when it holds
+none, the backup ends `Failed` with reason `RecordedTargetNotStarted`, and
+nothing runs. When it cannot be asked (no answer, a refused token, a manager
+without the lookup or without a store), the backup ends `Failed` with reason
+`RecordedTargetUnverified`: a backup may still run on that member and upload
+under this backup's prefix, and the message names the member to check. In
+neither case is another member started, then or later. The bound is not the
+time a backup takes: an adopted operation is polled until it ends. While its
+member is reachable the Instance Manager's backup time limit
+(`IM_BACKUP_TIMEOUT`, default 2h) ends it; while the member does not answer,
+the operator keeps polling until it does. It covers a
+member restart or a failover and its settling, and an operator who restarts
+a Pod to apply `spec.objectStorage`. Limit: a start delayed in the network
+beyond the bound and the lookup could still be taken after the backup ended
+`RecordedTargetNotStarted`; it writes only under this backup's own prefix,
+which no other backup uses (#337 covers a second writer of one prefix).
+The times of both bounds are taken from the operator's clock, stored in
+status and compared with the operator's clock later; operator processes
+whose clocks differ move the bound by that difference.
+
 The cluster a backup names (#289). A backup whose cluster is not found is not
 failed at once: the cluster may be created a moment after the backup, or the
 operator may read from a cache that does not hold it yet. The backup stays
@@ -207,8 +241,21 @@ spec:
   the old environment until it is deleted. Before dispatching, the controller
   compares the `IM_S3_*` environment of the selected Pod with the cluster's
   `spec.objectStorage`; on a difference it starts nothing, records no target,
-  and waits with `Ready=False`, reason `ObjectStorageNotApplied`. The wait is
-  not bounded yet (#365). To let the backup go on, restart the Pod (one at a
+  and waits with `Ready=False`, reason `ObjectStorageNotApplied`. After 30
+  minutes of this wait without interruption, counted from the first
+  reconcile that found it (`status.objectStorageNotAppliedSince`), the
+  backup ends `Failed` with reason `ObjectStorageWaitExpired`, with nothing
+  started on any member (#365). A backup that waited for another reason
+  before gets the whole 30 minutes. A reconcile that finds no safe target,
+  or a cluster without `spec.objectStorage`, clears the time, and the bound
+  starts again the next time a Pod without the settings is selected. So
+  this bound is not a limit on how long a backup stays `Pending`: a backup
+  that goes back and forth between this wait and the wait for a safe target
+  faster than every 30 minutes stays `Pending`. Nothing is dispatched
+  meanwhile. The wait for a safe target and `ObjectStorageNotConfigured`
+  (with no target recorded) are not bounded; that is outside #365. The HA seed backup's wait on its source
+  (`BootstrapReady`, ADR-0010) is not bounded by this: it is a step of the
+  cluster's bootstrap, not a `CubridBackup`. To let the backup go on, restart the Pod (one at a
   time, standbys first, while no backup or restore runs on it) so that it is
   recreated with the cluster's settings. A target that is already recorded is
   not compared: the earlier dispatch to it may have been accepted with its
@@ -224,7 +271,8 @@ spec:
   manager checks again before `backupdb` runs: a request without an upload
   bucket is answered 400 and a manager started without an endpoint 412, with
   no `backupdb` run and no operation recorded; the controller reports the
-  412 as `ObjectStorageNotApplied` as well.
+  412 as `ObjectStorageNotApplied` as well, bounded like any wait on a
+  recorded target.
 - **Full backups only** (`level: Full` → CUBRID level 0); no incremental
   chains in v1alpha1.
 - **Single-shot only**; scheduling is a future separate API
@@ -258,14 +306,15 @@ cluster UID/instance/role, timestamps).
 
 `CubridBackup.status`: `phase` (Pending|Running|Uploading|Completed|
 Failed), `operationRef`, `targetInstance`, `targetRole`, `fallbackUsed`,
-`startedAt`/`completedAt`, `artifact{uri(→manifest), manifestDigest,
+`targetRecordedAt`, `objectStorageNotAppliedSince`, `startedAt`/`completedAt`, `artifact{uri(→manifest), manifestDigest,
 sizeBytes, cubridVersion, database, level}`, `conditions`
 (`Accepted`/`Ready` with open-ended reasons: `StandbySelected`,
 `MasterFallbackSelected`, `NoHealthyStandby`, `BackupRunning`,
 `UploadRunning`, `BackupCompleted`, `BackupFailed`, `ChecksumMismatch`,
 `InsufficientStagingSpace`, `InstanceManagerUnavailable`,
 `InstanceManagerTokenRefused`, `ObjectStorageNotConfigured`,
-`ObjectStorageNotApplied`, `UnsupportedDestination`,
+`ObjectStorageNotApplied`, `UnsupportedDestination`, `RecordedTargetNotEligible`,
+`RecordedTargetNotStarted`, `RecordedTargetUnverified`, `ObjectStorageWaitExpired`,
 `ObjectStorageUnavailable`). Cluster-level: `BackupReady`
 (True/False/Unknown) + `lastSuccessfulBackupRef`/artifact summary.
 **Backup state must not be conflated with cluster/HA readiness.**
