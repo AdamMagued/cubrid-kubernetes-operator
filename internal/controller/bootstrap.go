@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"strings"
@@ -71,6 +72,12 @@ func (r *CubridClusterReconciler) reconcileRecovery(ctx context.Context, cluster
 		}
 	}
 
+	// A failed recovery is terminal: the member is not asked again, so the
+	// reason it failed with stays.
+	if cluster.Status.Bootstrap.Phase == databasev1alpha1.BootstrapFailed {
+		return ctrl.Result{}, true
+	}
+
 	if r.Restore == nil {
 		setCondition(cluster, conditionBootstrapReady, metav1.ConditionFalse, "RestoreClientNotConfigured",
 			"no restore client configured on the controller")
@@ -97,9 +104,26 @@ func (r *CubridClusterReconciler) reconcileRecovery(ctx context.Context, cluster
 			StagingDir:            path.Join(restoreStagingRoot, string(cluster.UID)),
 			TargetDir:             restoreTargetRoot,
 		}
-		op, err := r.Restore.StartRestore(ctx, target, cluster.Namespace, recoveryIdempotencyKey(cluster, target), req)
+		key := recoveryIdempotencyKey(cluster, target)
+		op, err := r.Restore.StartRestore(ctx, target, cluster.Namespace, key, req)
 		if err != nil {
-			setCondition(cluster, conditionBootstrapReady, metav1.ConditionFalse, "RestoreStartFailed", err.Error())
+			op, err = operationOfKey(ctx, err, instancemanager.OpRestore, key, func() (instancemanager.Operation, bool, error) {
+				return r.Restore.FindOperation(ctx, target, cluster.Namespace, instancemanager.OpRestore, key)
+			})
+		}
+		// A request the member refuses as such is refused again: it counts
+		// as a failed attempt.
+		if errors.Is(err, errRequestRefused) {
+			return r.restoreAttemptFailed(cluster, target, err.Error())
+		}
+		if err != nil {
+			// A refused token and each cause of a conflict keep a reason of
+			// their own; any other failure is a failed start.
+			reason := instanceManagerFailureReason(err)
+			if reason == reasonInstanceManagerUnavailable {
+				reason = "RestoreStartFailed"
+			}
+			setCondition(cluster, conditionBootstrapReady, metav1.ConditionFalse, reason, err.Error())
 			return ctrl.Result{RequeueAfter: restorePollAfter}, true
 		}
 		cluster.Status.Bootstrap.OperationID = op.ID
@@ -122,26 +146,31 @@ func (r *CubridClusterReconciler) reconcileRecovery(ctx context.Context, cluster
 		setCondition(cluster, conditionBootstrapReady, metav1.ConditionTrue, "RecoveryComplete", "restore completed on "+target)
 		return ctrl.Result{}, false
 	case instancemanager.OpFailed:
-		// A failed restore, which includes one cut off by a manager restart, is
-		// started again under the next attempt's key. The Instance Manager
-		// removes what its own failed restore left before it restores again,
-		// and nothing else (ADR-0008).
-		boot := cluster.Status.Bootstrap
-		if boot.Attempts+1 < maxBootstrapAttempts {
-			boot.Attempts++
-			boot.OperationID = ""
-			msg := fmt.Sprintf("on %s: %s; starting attempt %d of %d", target, op.FailureReason, boot.Attempts+1, maxBootstrapAttempts)
-			setCondition(cluster, conditionBootstrapReady, metav1.ConditionFalse, "RestoreFailedRetrying", msg)
-			r.statusEvent(cluster, corev1.EventTypeWarning, "RestoreFailedRetrying", msg)
-			return ctrl.Result{RequeueAfter: restorePollAfter}, true
-		}
-		r.recoveryFailed(cluster, "RestoreFailed",
-			fmt.Sprintf("on %s: %s; giving up after %d attempts", target, op.FailureReason, maxBootstrapAttempts))
-		return ctrl.Result{}, true
+		return r.restoreAttemptFailed(cluster, target, op.FailureReason)
 	default:
 		setRestoreProgress(cluster, op.State, target)
 		return ctrl.Result{RequeueAfter: restorePollAfter}, true
 	}
+}
+
+// restoreAttemptFailed ends an attempt of the recovery restore for why. A
+// failed restore, which includes one cut off by a manager restart, is
+// started again under the next attempt's key. The Instance Manager removes
+// what its own failed restore left before it restores again, and nothing
+// else (ADR-0008). After the last attempt the recovery is Failed.
+func (r *CubridClusterReconciler) restoreAttemptFailed(cluster *databasev1alpha1.CubridCluster, target, why string) (ctrl.Result, bool) {
+	boot := cluster.Status.Bootstrap
+	if boot.Attempts+1 < maxBootstrapAttempts {
+		boot.Attempts++
+		boot.OperationID = ""
+		msg := fmt.Sprintf("on %s: %s; starting attempt %d of %d", target, why, boot.Attempts+1, maxBootstrapAttempts)
+		setCondition(cluster, conditionBootstrapReady, metav1.ConditionFalse, "RestoreFailedRetrying", msg)
+		r.statusEvent(cluster, corev1.EventTypeWarning, "RestoreFailedRetrying", msg)
+		return ctrl.Result{RequeueAfter: restorePollAfter}, true
+	}
+	r.recoveryFailed(cluster, "RestoreFailed",
+		fmt.Sprintf("on %s: %s; giving up after %d attempts", target, why, maxBootstrapAttempts))
+	return ctrl.Result{}, true
 }
 
 // setRestoreProgress reports a restore operation that has not ended, by what

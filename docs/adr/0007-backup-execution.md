@@ -339,7 +339,14 @@ sizeBytes, cubridVersion, database, level}`, `conditions`
 `MasterFallbackSelected`, `NoHealthyStandby`, `BackupRunning`,
 `UploadRunning`, `BackupCompleted`, `BackupFailed`, `ChecksumMismatch`,
 `InsufficientStagingSpace`, `InstanceManagerUnavailable`,
-`InstanceManagerTokenRefused`, `ObjectStorageNotConfigured`,
+`InstanceManagerTokenRefused`, `InstanceManagerOperationInProgress`,
+`InstanceManagerStagingInUse`, `InstanceManagerRequestConflict`,
+`InstanceManagerConflict` (a 409 by the cause its code names, ADR-0003; each
+waits on the recorded target like any refused start),
+`InstanceManagerRequestRefused` (a start refused as a request, 400, 413 or
+422, ADR-0003: the backup ends `Failed` unless the target holds an
+operation of it, and waits within the bound while that cannot be asked),
+`ObjectStorageNotConfigured`,
 `ObjectStorageNotApplied`, `UnsupportedDestination`, `RecordedTargetNotEligible`,
 `RecordedTargetNotStarted`, `RecordedTargetUnverified`, `ObjectStorageWaitExpired`,
 `ObjectStorageUnavailable`). Cluster-level: `BackupReady`

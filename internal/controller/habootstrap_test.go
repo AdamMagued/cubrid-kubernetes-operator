@@ -19,6 +19,10 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
@@ -54,6 +58,10 @@ func (f *fakeHABootstrapClient) StartHABootstrap(_ context.Context, podName, _, 
 	return instancemanager.Operation{ID: "op-ha", State: f.state, FailureReason: f.reason}, nil
 }
 
+func (f *fakeHABootstrapClient) FindOperation(_ context.Context, _, _ string, _ instancemanager.OperationKind, _ string) (instancemanager.Operation, bool, error) {
+	return instancemanager.Operation{}, false, errors.New("not used by these tests")
+}
+
 // fakeSeedClient stands in for the backup and restore side of seeding. It
 // answers each member with the state set for it.
 type fakeSeedClient struct {
@@ -71,6 +79,29 @@ type fakeSeedClient struct {
 	restores map[string]instancemanager.RestoreRequest
 	// backupStates overrides backupState for the backups of single members.
 	backupStates map[string]instancemanager.OperationState
+	// heldKeys makes the fake answer like an Instance Manager does when a key
+	// is sent again with another request: 409 IdempotencyConflict, and the
+	// operation stays the one first started under the key. lookups counts
+	// the lookups by key.
+	heldKeys bool
+	lookups  int
+	// restoreByKey overrides restore for the operation under one key, and
+	// restoredFrom names the manifest an operation under a key restored.
+	restoreByKey map[string]instancemanager.OperationState
+	restoredFrom map[string]string
+}
+
+// restoreOp is the restore operation the fake holds on podName under key.
+func (f *fakeSeedClient) restoreOp(podName, key string) instancemanager.Operation {
+	state := f.restore[podName]
+	if s, ok := f.restoreByKey[key]; ok {
+		state = s
+	}
+	op := instancemanager.Operation{ID: "op-seed-" + podName, Kind: instancemanager.OpRestore, State: state, FailureReason: f.reason}
+	if uri, ok := f.restoredFrom[key]; ok {
+		op.Restored = &instancemanager.OperationArtifact{ManifestURI: uri}
+	}
+	return op
 }
 
 // seedBackup is one backup the fake was asked for.
@@ -81,10 +112,13 @@ type seedBackup struct {
 
 func (f *fakeSeedClient) StartBackup(_ context.Context, podName, _, key string, req instancemanager.BackupRequest) (instancemanager.Operation, error) {
 	f.backupOn = append(f.backupOn, podName)
-	f.backupReq = req
 	if f.backups == nil {
 		f.backups = map[string]seedBackup{}
 	}
+	if held, ok := f.backups[key]; ok && f.heldKeys && !reflect.DeepEqual(held.req, req) {
+		return instancemanager.Operation{}, fmt.Errorf("start backup on %s: %w", podName, imIdempotencyConflict())
+	}
+	f.backupReq = req
 	f.backups[key] = seedBackup{member: podName, req: req}
 	state := f.backupState
 	if s, ok := f.backupStates[podName]; ok {
@@ -98,21 +132,48 @@ func (f *fakeSeedClient) StartRestore(_ context.Context, podName, _, key string,
 	if f.restoreKeys == nil {
 		f.restoreKeys = map[string]string{}
 	}
+	if f.heldKeys && f.restoreKeys[podName] == key && !reflect.DeepEqual(f.restores[podName], req) {
+		return instancemanager.Operation{}, fmt.Errorf("start restore on %s: %w", podName, imIdempotencyConflict())
+	}
 	f.restoreKeys[podName] = key
 	f.restoreReq = req
 	if f.restores == nil {
 		f.restores = map[string]instancemanager.RestoreRequest{}
 	}
 	f.restores[podName] = req
-	return instancemanager.Operation{ID: "op-seed-" + podName, State: f.restore[podName], FailureReason: f.reason}, nil
+	return f.restoreOp(podName, key), nil
 }
 
 func (f *fakeSeedClient) GetOperation(_ context.Context, _, _, _ string) (instancemanager.Operation, error) {
 	return instancemanager.Operation{}, errors.New("not used by seeding")
 }
 
-func (f *fakeSeedClient) FindBackupOperation(_ context.Context, _, _, _ string) (instancemanager.Operation, bool, error) {
-	return instancemanager.Operation{}, false, errors.New("not used by seeding")
+func (f *fakeSeedClient) FindBackupOperation(_ context.Context, _, _, key string) (instancemanager.Operation, bool, error) {
+	f.lookups++
+	held, ok := f.backups[key]
+	if !ok {
+		return instancemanager.Operation{}, false, nil
+	}
+	state := f.backupState
+	if s, ok := f.backupStates[held.member]; ok {
+		state = s
+	}
+	return instancemanager.Operation{ID: "op-seed-backup", Kind: instancemanager.OpBackup, State: state, FailureReason: f.reason}, true, nil
+}
+
+func (f *fakeSeedClient) FindOperation(_ context.Context, podName, _ string, kind instancemanager.OperationKind, key string) (instancemanager.Operation, bool, error) {
+	f.lookups++
+	if kind != instancemanager.OpRestore || f.restoreKeys[podName] != key {
+		return instancemanager.Operation{}, false, nil
+	}
+	return f.restoreOp(podName, key), true, nil
+}
+
+// imIdempotencyConflict is what the client makes of an Instance Manager's
+// 409 for a key sent again with another request.
+func imIdempotencyConflict() error {
+	return unexpectedStatus(&http.Response{StatusCode: http.StatusConflict, Header: http.Header{},
+		Body: io.NopCloser(strings.NewReader(`{"error":"idempotency key reused with a different request","code":"IdempotencyConflict"}`))})
 }
 
 // firstMemberMaster answers as the members of a group that is being formed
@@ -284,6 +345,33 @@ var _ = Describe("HA bootstrap of the first database (ADR-0010, #106)", func() {
 		Expect(boot.members).To(HaveLen(2))
 	})
 
+	It("counts a creation the member refuses as invalid as a failed attempt, and stops (#302)", func() {
+		boot := &fakeHABootstrapClient{err: imAnswer(http.StatusBadRequest, `{"error":"database name is not a plain identifier"}`)}
+		key := create(haCluster("boot-invalid"))
+		r := reconcilerWith(boot)
+		var got *databasev1alpha1.CubridCluster
+		for range maxBootstrapAttempts {
+			got = reconcileOnce(r, key)
+		}
+		Expect(got.Status.Databases[0].Phase).To(Equal(databasePhaseFailed))
+		cond := meta.FindStatusCondition(got.Status.Conditions, conditionBootstrapReady)
+		Expect(cond.Reason).To(Equal("DatabaseCreationFailed"))
+		Expect(cond.Message).To(ContainSubstring("not a plain identifier"))
+		reconcileOnce(r, key)
+		Expect(boot.members).To(HaveLen(maxBootstrapAttempts))
+	})
+
+	It("waits on a member that answers as no HA member, without using up an attempt (#302)", func() {
+		boot := &fakeHABootstrapClient{err: imAnswer(http.StatusConflict,
+			`{"error":"this member is a standalone server, not an HA member","code":"NotAnHAMember"}`)}
+		key := create(haCluster("boot-not-ha"))
+		r := reconcilerWith(boot)
+		reconcileOnce(r, key)
+		got := reconcileOnce(r, key)
+		Expect(got.Status.Databases[0].BootstrapAttempts).To(BeZero())
+		Expect(meta.FindStatusCondition(got.Status.Conditions, conditionBootstrapReady).Reason).To(Equal(reasonNotAnHAMember))
+	})
+
 	Context("seeding the other members", func() {
 		seededCluster := func(name string) *databasev1alpha1.CubridCluster {
 			c := haCluster(name)
@@ -380,6 +468,129 @@ var _ = Describe("HA bootstrap of the first database (ADR-0010, #106)", func() {
 			reconcileOnce(r, key)
 			Expect(seed.backupOn).To(BeEmpty())
 			Expect(seed.restoreOn).To(BeEmpty())
+		})
+
+		// A key names one request. When the spec changes while the step of a
+		// key runs, the member refuses the changed request under that key; the
+		// operation the key names is followed instead, and the change applies
+		// from the next step on (#302).
+		It("follows the seed backup its key names when the spec changed meanwhile, and goes on", func() {
+			seed := &fakeSeedClient{
+				backupState: instancemanager.OpRunningBackup,
+				restore:     map[string]instancemanager.OperationState{},
+				heldKeys:    true,
+			}
+			key := create(seededCluster("seed-changed"))
+			r := reconcilerFor(seed)
+			got := reconcileOnce(r, key)
+			_, reason := bootstrapCondition(got)
+			Expect(reason).To(Equal("SeedBackupInProgress"))
+			Expect(seed.backups).To(HaveLen(1))
+
+			By("a spec.version that the running backup was not started with")
+			got.Spec.Version = cubridVersion + ".1"
+			Expect(k8sClient.Update(ctx, got)).To(Succeed())
+			for range 2 {
+				got = reconcileOnce(r, key)
+				_, reason = bootstrapCondition(got)
+				Expect(reason).To(Equal("SeedBackupInProgress"), "the operation the key names is followed")
+			}
+			Expect(seed.lookups).To(Equal(2))
+			Expect(seed.backupOn).To(HaveLen(3), "one start for each reconcile, no more")
+			Expect(seed.backups).To(HaveLen(1))
+			for _, b := range seed.backups {
+				Expect(b.req.Upload.CubridVersion).To(Equal(cubridVersion), "the first request stays the one of its key")
+			}
+
+			By("the backup completing: the restore is started with the changed spec")
+			seed.backupState = instancemanager.OpCompleted
+			seed.restore["seed-changed-1"] = instancemanager.OpRestoring
+			got = reconcileOnce(r, key)
+			_, reason = bootstrapCondition(got)
+			Expect(reason).To(Equal("SeedRestoreInProgress"))
+			Expect(seed.restoreReq.ExpectedCubridVersion).To(Equal(cubridVersion + ".1"))
+		})
+
+		// The restore of a later member is started from the master that was
+		// observed; when the write that recorded its operation is lost and
+		// another member is master by the next reconcile, the next round's
+		// restore has a key of its own, so the operation from the earlier
+		// source is never taken for it (ADR-0005, #302).
+		It("does not take an earlier source's restore for a later round after a lost status write", func() {
+			const n = "seed-lostwrite"
+			seed := &fakeSeedClient{
+				backupState:  instancemanager.OpCompleted,
+				restore:      map[string]instancemanager.OperationState{n + "-1": instancemanager.OpCompleted, n + "-2": instancemanager.OpRestoring},
+				heldKeys:     true,
+				restoreByKey: map[string]instancemanager.OperationState{},
+			}
+			key := create(seededCluster(n))
+			r := reconcilerFor(seed)
+			prober := &memberProber{master: n + "-0"}
+			r.Prober = prober
+
+			got := reconcileOnce(r, key)
+			Expect(got.Status.Databases[0].SeededMembers).To(Equal([]string{n + "-1"}))
+			got = reconcileOnce(r, key)
+			_, reason := bootstrapCondition(got)
+			Expect(reason).To(Equal("SeedRestoreInProgress"))
+			Expect(seed.restores[n+"-2"].SeedFromMaster).To(Equal(n + "-0"))
+			keyFromA := seed.restoreKeys[n+"-2"]
+
+			By("the write of the restore's operation being lost, that restore completing, and " + n + "-1 becoming the master")
+			got.Status.Databases[0].Seeding.RestoreOperationID = ""
+			Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
+			seed.restoreByKey[keyFromA] = instancemanager.OpCompleted
+			prober.master = n + "-1"
+			got = reconcileOnce(r, key)
+			Expect(got.Status.Databases[0].Seeding).To(Equal(
+				&databasev1alpha1.DatabaseSeeding{Member: n + "-2", Source: n + "-1", Round: 1}))
+
+			lookups := seed.lookups
+			got = reconcileOnce(r, key)
+			Expect(got.Status.Databases[0].SeededMembers).NotTo(ContainElement(n+"-2"),
+				"the member was recorded as seeded from the earlier source's restore")
+			_, reason = bootstrapCondition(got)
+			Expect(reason).To(Equal("SeedRestoreInProgress"))
+			Expect(seed.restoreKeys[n+"-2"]).NotTo(Equal(keyFromA))
+			Expect(seed.restores[n+"-2"].SeedFromMaster).To(Equal(n + "-1"))
+			Expect(seed.lookups).To(Equal(lookups), "the earlier source's restore was looked up")
+		})
+
+		// An operation that is followed instead of a changed request is taken
+		// as the step's only when what it restored is the backup of the step
+		// (#302).
+		It("does not record a member seeded by a followed restore of another backup", func() {
+			const n = "seed-mismatch"
+			seed := &fakeSeedClient{
+				backupState:  instancemanager.OpCompleted,
+				restore:      map[string]instancemanager.OperationState{n + "-1": instancemanager.OpRestoring},
+				heldKeys:     true,
+				restoreByKey: map[string]instancemanager.OperationState{},
+				restoredFrom: map[string]string{},
+			}
+			key := create(seededCluster(n))
+			r := reconcilerFor(seed)
+			got := reconcileOnce(r, key)
+			_, reason := bootstrapCondition(got)
+			Expect(reason).To(Equal("SeedRestoreInProgress"))
+			restoreKey := seed.restoreKeys[n+"-1"]
+
+			By("the spec changing while the restore runs, which reports another backup when it completes")
+			got.Spec.Version = cubridVersion + ".1"
+			Expect(k8sClient.Update(ctx, got)).To(Succeed())
+			seed.restoreByKey[restoreKey] = instancemanager.OpCompleted
+			base := "s3://cluster-artifacts/prod/" + string(got.UID)
+			seed.restoredFrom[restoreKey] = base + "/seed-" + n + "-2-from-" + n + "-0/appdb/manifest.json"
+			got = reconcileOnce(r, key)
+			Expect(got.Status.Databases[0].SeededMembers).To(BeEmpty())
+			_, reason = bootstrapCondition(got)
+			Expect(reason).To(Equal("SeedRestoreSourceMismatch"))
+
+			By("the restore reporting the backup of the step")
+			seed.restoredFrom[restoreKey] = base + "/seed/appdb/manifest.json"
+			got = reconcileOnce(r, key)
+			Expect(got.Status.Databases[0].SeededMembers).To(ContainElement(n + "-1"))
 		})
 
 		It("starts a failed restore again without touching a seeded member (#107)", func() {
