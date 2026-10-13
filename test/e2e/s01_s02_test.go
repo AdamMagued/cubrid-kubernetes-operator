@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -200,7 +201,7 @@ func (r *haRun) memberRows(pod string) ([]workload.Row, error) {
 // catalog lists the columns of the workload's tables on a member.
 func (r *haRun) catalog(pod string) (string, error) {
 	values, err := r.memberValues(pod, `SELECT class_name || '.' || attr_name || ':' || data_type AS v`+
-		` FROM db_attribute WHERE class_name IN ('ledger', 'marker', 's02_added') ORDER BY 1;`)
+		` FROM db_attribute WHERE class_name IN ('ledger', 'marker', 's02_added', 's02_marker') ORDER BY 1;`)
 	return strings.Join(values, "\n"), err
 }
 
@@ -382,14 +383,42 @@ func s01AndS02Steps(r *haRun) {
 		_, err = runSQL(csqlInPod(r.namespace, master, r.database),
 			"ALTER TABLE ledger ADD COLUMN extra VARCHAR(16);"+
 				" CREATE TABLE s02_added (id INT PRIMARY KEY, v VARCHAR(16));"+
-				" INSERT INTO s02_added VALUES (1, 'added'); COMMIT;")
+				" INSERT INTO s02_added VALUES (1, 'added');"+
+				" CREATE TABLE s02_marker (id INT PRIMARY KEY, v VARCHAR(40)); COMMIT;")
 		Expect(err).NotTo(HaveOccurred())
 
 		By("running inserts and rolled-back transactions through the read-write Service")
 		run, err := r.runWorkload("CLIENT_ID=c2 OPS=40")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(run.Counts[workload.Acknowledged]).To(Equal(40), "with no fault every operation is acknowledged")
+
+		// replication_limit is timed on one row, committed after everything
+		// above, until each slave returns it and holds as many ledger rows as
+		// the master. The clock starts before the commit is sent, so the time
+		// is an upper bound; the full check below is not part of it.
+		By("committing a marker row on the master and timing until every slave returns it with every row")
+		ledgerRows := "SELECT CAST(COUNT(*) AS VARCHAR(20)) AS n FROM ledger;"
+		wantRows, err := r.memberValues(master, ledgerRows)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(wantRows).To(HaveLen(1), "the ledger row count on the master")
+		marker := fmt.Sprintf("marker-%d", time.Now().UnixNano())
 		committed := time.Now()
+		_, err = runSQL(csqlInPod(r.namespace, master, r.database),
+			"INSERT INTO s02_marker VALUES (1, '"+marker+"'); COMMIT;")
+		Expect(err).NotTo(HaveOccurred())
+		visibleCtx, cancelVisible := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancelVisible()
+		seen, err := workload.WaitVisible(visibleCtx, committed, slaves, 200*time.Millisecond,
+			func(_ context.Context, slave string) (bool, error) {
+				values, err := r.memberValues(slave, "SELECT v FROM s02_marker WHERE id = 1;")
+				if err != nil || !slices.Equal(values, []string{marker}) {
+					return false, err
+				}
+				rows, err := r.memberValues(slave, ledgerRows)
+				return slices.Equal(rows, wantRows), err
+			})
+		Expect(err).NotTo(HaveOccurred())
+		_, replication := workload.Slowest(seen)
 
 		By("waiting until every member holds the same rows and the same schema")
 		var report workload.Report
@@ -412,8 +441,8 @@ func s01AndS02Steps(r *haRun) {
 			}
 		}
 		Eventually(converged, 2*time.Minute, time.Second).Should(Succeed())
-		// An upper bound: it includes the time the checks themselves take.
-		replication := time.Since(committed)
+		// Recorded, not judged: it includes the time the checks take.
+		fullCheck := time.Since(committed)
 
 		By("reading the fail count of each slave's applier")
 		for _, slave := range slaves {
@@ -484,6 +513,7 @@ func s01AndS02Steps(r *haRun) {
 			ID: "S02",
 			Measurements: map[string]any{
 				"replicationObservedWithin": replication.Round(time.Millisecond).String(),
+				"fullCheckPassedWithin":     fullCheck.Round(time.Millisecond).String(),
 				"slaveReplacementTime":      outcome.OutcomeAt.Sub(outcome.FaultIssuedAt).Round(time.Millisecond).String(),
 				"acknowledgedMissing":       report.AcknowledgedMissing,
 			},
