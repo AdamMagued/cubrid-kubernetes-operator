@@ -273,7 +273,9 @@ seeded; the phase is then `Complete`, or `Failed` when the seeding gave up. A
 standalone cluster is complete when its restore has completed. While the
 peers are seeded, `Ready` and `Progressing` carry the reason
 `RecoverySeedingReplicas`, and the `DatabaseRestored` event marks the end of
-the restore.
+the restore. When the recovery has ended as `Failed`, `Ready` stays False and
+`Progressing` is False, both with the reason `BootstrapRecoveryFailed` and
+the message of `BootstrapReady`: nothing is in progress any more.
 
 Upgrade note: an Operator version without #268 recorded an HA recovery as
 `Complete` after the restore of the target member alone, without seeding the
@@ -317,7 +319,7 @@ status:
   conditions:
     - { type: BootstrapReady, status: "False", reason: RestoreInProgress }
     - { type: RecoveryValidated, status: "False", reason: WaitingForDatabaseOpen }
-    - { type: Ready, status: "False", reason: BootstrapRecoveryInProgress }
+    - { type: Ready, status: "False", reason: BootstrapRecoveryInProgress }  # BootstrapRecoveryFailed when state is Failed
 ```
 
 Open-ended reasons, consistent with prior ADRs.

@@ -37,6 +37,9 @@ const (
 	restorePollAfter        = 10 * time.Second
 	restoreStagingRoot      = "/var/lib/cubrid/restore-staging"
 	restoreTargetRoot       = "/var/lib/cubrid/databases"
+	// reasonBootstrapRecoveryFailed is the Ready and Progressing reason of a
+	// cluster whose recovery bootstrap ended as Failed.
+	reasonBootstrapRecoveryFailed = "BootstrapRecoveryFailed"
 )
 
 // recoveryActive reports whether this cluster is a recovery-bootstrap that has
