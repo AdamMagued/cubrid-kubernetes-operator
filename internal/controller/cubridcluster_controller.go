@@ -146,6 +146,9 @@ type CubridClusterReconciler struct {
 // reconcile that writes it (docs/observability.md).
 type reconcileReport struct {
 	// before is the status the reconcile started from, as it is stored.
+	// writeStatus compares with it to hold observation times back, so a
+	// write retried after a conflict (RetryOnConflict) must read the cluster
+	// again and replace it, or the comparison is with an outdated status.
 	before *databasev1alpha1.CubridClusterStatus
 	// statusWritten says that the last write of the status succeeded.
 	statusWritten bool

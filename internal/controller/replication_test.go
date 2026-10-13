@@ -33,6 +33,11 @@ const (
 	replSlaveB = "demo-2"
 )
 
+// historyExpired is an age of the stored reading past which its history is
+// dropped: replicationHistoryTTL, plus how far holdObservationTimes may hold
+// its observedAt behind the last reading.
+const historyExpired = replicationHistoryTTL + observationWriteInterval + time.Second
+
 func repl(changes, delayed int64, stalledAgo time.Duration) *databasev1alpha1.InstanceReplication {
 	read := metav1.NewTime(testNow.Add(-haResyncInterval))
 	r := &databasev1alpha1.InstanceReplication{Source: replMaster, AppliedChanges: changes, DelayedPages: delayed,
@@ -63,15 +68,16 @@ func TestNextReplication(t *testing.T) {
 		wantStalled time.Duration // how long ago; negative for "not stalled"
 	}{
 		"no observation and no history": {nil, nil, true, -1},
-		"the history has expired":       {readAgo(repl(10, 9, 40*time.Second), replicationHistoryTTL+time.Second), nil, true, -1},
+		"the history has expired":       {readAgo(repl(10, 9, 40*time.Second), historyExpired), nil, true, -1},
 		"a reading without a time is no history": {&databasev1alpha1.InstanceReplication{Source: replMaster, AppliedChanges: 10, DelayedPages: 4},
 			obs(10, 9), false, -1},
-		"pages wait across an expired history": {readAgo(repl(10, 9, 40*time.Second), replicationHistoryTTL+time.Second), obs(10, 9), false, -1},
+		"pages wait across an expired history": {readAgo(repl(10, 9, 40*time.Second), historyExpired), obs(10, 9), false, -1},
 		"pages wait across a missed reading":   {readAgo(repl(10, 9, 40*time.Second), 2*haResyncInterval), obs(10, 9), false, 40 * time.Second},
-		// 120s is twice the stall window: a gap of a whole window is kept.
-		"kept 119s without a reading":    {readAgo(repl(10, 9, 150*time.Second), 119*time.Second), nil, false, 150 * time.Second},
-		"dropped 121s without a reading": {readAgo(repl(10, 9, 150*time.Second), 121*time.Second), nil, true, -1},
-		"pages wait after a 121s gap":    {readAgo(repl(10, 9, 150*time.Second), 121*time.Second), obs(10, 9), false, -1},
+		// 120s is twice the stall window: a gap of a whole window is kept,
+		// also from a stored reading held 30s behind the last one (150s).
+		"kept 149s without a reading":    {readAgo(repl(10, 9, 180*time.Second), 149*time.Second), nil, false, 180 * time.Second},
+		"dropped 151s without a reading": {readAgo(repl(10, 9, 180*time.Second), 151*time.Second), nil, true, -1},
+		"pages wait after a 151s gap":    {readAgo(repl(10, 9, 180*time.Second), 151*time.Second), obs(10, 9), false, -1},
 		// The clock went back, or another Operator instance took over.
 		"a reading stamped in the future, within the skew": {readAgo(repl(10, 9, 0), -roleObservationTTL), nil, false, 0},
 		"a reading stamped in the future, beyond the skew": {readAgo(repl(10, 9, 0), -roleObservationTTL-time.Second), nil, true, -1},
@@ -283,7 +289,7 @@ func TestInstanceStatuses_ReplicationAcrossMissedReadings(t *testing.T) {
 	}
 }
 
-// Readings missed for longer than replicationHistoryTTL end the series: the
+// Readings missed for longer than historyExpired end the series: the
 // next reading starts a new one, and in between the condition is Unknown.
 func TestInstanceStatuses_ReplicationHistoryExpires(t *testing.T) {
 	members := []string{replMaster, replSlaveA}
@@ -295,7 +301,7 @@ func TestInstanceStatuses_ReplicationHistoryExpires(t *testing.T) {
 		}
 	}
 	status := instanceStatuses(members, obsAt(testNow, stuck), testNow, nil)
-	later := testNow.Add(replicationHistoryTTL + time.Second)
+	later := testNow.Add(historyExpired)
 	gap := instanceStatuses(members, obsAt(later, nil), later, status)
 	if r := gap[1].Replication; r != nil {
 		t.Errorf("replication after the history expired = %+v, want none", r)
@@ -306,6 +312,54 @@ func TestInstanceStatuses_ReplicationHistoryExpires(t *testing.T) {
 	again := later.Add(haResyncInterval)
 	if r := instanceStatuses(members, obsAt(again, stuck), again, gap)[1].Replication; r == nil || r.StalledSince != nil {
 		t.Errorf("first reading of a new series = %+v, want it not stalled", r)
+	}
+}
+
+// A stored reading whose observedAt was held back by holdObservationTimes is
+// up to observationWriteInterval older than the last real reading. A gap in
+// the readings that is within replicationHistoryTTL of the last real reading
+// must still keep the stall series (#370 review).
+func TestInstanceStatuses_HeldReadingKeepsTheStallSeries(t *testing.T) {
+	members := []string{replMaster, replSlaveA}
+	stuck := &ReplicationObservation{Source: replMaster, AppliedChanges: 10, DelayedPages: 9}
+	obsAt := func(when time.Time, r *ReplicationObservation) map[string]RoleObservation {
+		return map[string]RoleObservation{
+			replMaster: {Reachable: true, Role: databasev1alpha1.RoleMaster, ObservedAt: when},
+			replSlaveA: {Reachable: true, Role: databasev1alpha1.RoleSlave, ObservedAt: when, Replication: r},
+		}
+	}
+	// pass is one reconcile: the status it computes, with the times held as
+	// writeStatus holds them, becomes the stored status.
+	var stored databasev1alpha1.CubridClusterStatus
+	pass := func(now time.Time, r *ReplicationObservation) {
+		next := stored.DeepCopy()
+		next.Instances = instanceStatuses(members, obsAt(now, r), now, stored.Instances)
+		at := metav1.NewTime(now)
+		next.LastObservedTime = &at
+		holdObservationTimes(&stored, next, now)
+		stored = *next
+	}
+	lastReal := testNow
+	for at := time.Duration(0); at <= 60*time.Second; at += haResyncInterval {
+		lastReal = testNow.Add(at)
+		pass(lastReal, stuck)
+	}
+	if r := stored.Instances[1].Replication; r == nil || r.StalledSince == nil || !r.ObservedAt.Time.Before(lastReal) {
+		t.Fatalf("stored reading = %+v, want a stall whose observedAt was held behind %s", r, lastReal)
+	}
+	since := stored.Instances[1].Replication.StalledSince.Time
+
+	// The applier cannot be read for a while, then answers again within
+	// replicationHistoryTTL of the last real reading.
+	back := lastReal.Add(replicationHistoryTTL - 15*time.Second)
+	for now := lastReal.Add(haResyncInterval); now.Before(back); now = now.Add(haResyncInterval) {
+		pass(now, nil)
+	}
+	pass(back, stuck)
+	r := stored.Instances[1].Replication
+	if r == nil || r.StalledSince == nil || !r.StalledSince.Time.Equal(since) {
+		t.Errorf("reading %s after the last real one = %+v, want the stall since %s kept",
+			back.Sub(lastReal), r, since)
 	}
 }
 

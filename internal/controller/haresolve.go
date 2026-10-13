@@ -254,7 +254,10 @@ func instanceStatuses(members []string, obs map[string]RoleObservation, now time
 		lastObserved := answered[m].DeepCopy()
 		if o, ok := obs[m]; ok && fresh(o, now) {
 			version = o.EngineVersion
-			at := metav1.NewTime(o.ObservedAt)
+			// The pass's time, which the cluster's lastObservedTime is set
+			// to, not the prober's stamp: an equal time means the member
+			// answered in that pass.
+			at := metav1.NewTime(now)
 			lastObserved = &at
 		}
 		// Only an authoritative slave's applier is taken into account. A

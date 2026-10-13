@@ -307,6 +307,7 @@ func (r *haRun) s06Absent() {
 	absence := &operatorAbsence{}
 	var newMaster, staleStatus, membersBeforeReturn string
 	var masterDeletedAt, lastObservedDuringAbsence time.Time
+	var ageBeforeAbsence time.Duration
 	outcome := r.runFault(faults.Scenario{
 		Fault:  absence,
 		Limits: s03FlowLimits,
@@ -314,7 +315,21 @@ func (r *haRun) s06Absent() {
 			if !operatorAvailable() {
 				return fmt.Errorf("the Operator is not available")
 			}
-			_, err := r.formationTime()
+			// The status is fresh while the Operator runs, also on a cluster
+			// in which nothing changes: otherwise a stale one during the
+			// absence would prove nothing.
+			s, err := r.status()
+			if err != nil {
+				return err
+			}
+			if s.lastObserved.IsZero() {
+				return fmt.Errorf("status.lastObservedTime is not set while the Operator runs")
+			}
+			if ageBeforeAbsence = time.Since(s.lastObserved); ageBeforeAbsence > statusStaleAfter {
+				return fmt.Errorf("status.lastObservedTime is %s old while the Operator runs, more than %s",
+					ageBeforeAbsence.Round(time.Second), statusStaleAfter)
+			}
+			_, err = r.formationTime()
 			return err
 		},
 		Check: func(ctx context.Context) (bool, error) {
@@ -446,6 +461,8 @@ func (r *haRun) s06Absent() {
 			"stableFor":           stable.Round(time.Millisecond).String(),
 			"operatorAbsentFor":   absence.returnedAt.Sub(outcome.FaultIssuedAt).Round(time.Millisecond).String(),
 			"statusDuringAbsence": staleStatus,
+			// Just before the absence, while the Operator ran.
+			"lastObservedAgeBeforeAbsence": ageBeforeAbsence.Round(time.Second).String(),
 			// After it was started again: until the status named the new
 			// master with every condition True.
 			"operatorResyncTime":       resync.Round(time.Millisecond).String(),

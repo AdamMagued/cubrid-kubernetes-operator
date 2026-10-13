@@ -338,11 +338,13 @@ type InstanceStatus struct {
 	// could not be read.
 	// +optional
 	Replication *InstanceReplication `json:"replication,omitempty"`
-	// lastObservedTime is when this member last gave the operator a reachable
-	// answer to its role query, whatever role it reported. A member that does
-	// not answer keeps the time of its last answer. A newer value of this time
-	// alone is written at most every 30 seconds, so a value up to 60 seconds
-	// old is current (docs/observability.md, "Freshness").
+	// lastObservedTime is the time of the observation in which this member
+	// last gave the operator a reachable answer to its role query, whatever
+	// role it reported: the cluster's lastObservedTime when it answered in
+	// that observation. A member that does not answer keeps the time of its
+	// last answer. A newer value of this time alone is written at most every
+	// 30 seconds, so it can understate the last answer by up to that much
+	// (docs/observability.md, "Freshness").
 	// +optional
 	LastObservedTime *metav1.Time `json:"lastObservedTime,omitempty"`
 }

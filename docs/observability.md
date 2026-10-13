@@ -162,7 +162,7 @@ An HA cluster with role discovery publishes when its HA status was observed:
 | Field | Meaning |
 |---|---|
 | `status.lastObservedTime` | When the Operator last asked every member for its role: the observation that `currentPrimary`, `instances[]` and `PrimaryResolved`, `HAReady` and `ReplicationHealthy` were derived from |
-| `status.instances[].lastObservedTime` | When that member last gave a reachable answer to the role query, whatever role it reported |
+| `status.instances[].lastObservedTime` | The time of the observation in which that member last gave a reachable answer to the role query, whatever role it reported; the same value as `status.lastObservedTime` for a member that answered in that observation |
 | `status.instances[].replication.observedAt` | When the slave's applier counters were last read |
 
 - **The times only move forward, and are not written on every pass.** The
@@ -170,7 +170,13 @@ An HA cluster with role discovery publishes when its HA status was observed:
   reconcile whose only change would be a newer time keeps the stored time
   while it is younger than 30 seconds (`observationWriteInterval`), so that an
   unchanged cluster is not written every 10 seconds. When the status is
-  written for any other reason, it carries the newest times.
+  written for any other reason, it carries the newest times. A stored time
+  can therefore be up to 30 seconds older than the observation it stands
+  for: a member's time understates its last answer by up to that much.
+- **A changing value is written on every pass.** Only the times are held.
+  When anything else in the status changes, for example a slave's applier
+  counters (`appliedChanges`, `delayedPages`) under load, the status is
+  written on every pass, as it was before these fields existed.
 - **A reconcile that does not observe the roles keeps the times.** After a
   failed step or during a recovery bootstrap the HA Conditions are `Unknown`
   with `RolesNotObserved`, and the times are neither advanced nor cleared:
@@ -185,8 +191,20 @@ An HA cluster with role discovery publishes when its HA status was observed:
   Operator adds to the age. A stale status must not be read as the current
   state of CUBRID: the Operator may be stopped, unable to reach the API
   server, or unable to observe the roles.
+- **Passes that take longer.** The 45 seconds assume a pass whose members
+  answer within the role query's timeout. Some passes do more before the
+  roles are asked, and the time of the observation is taken when the
+  answers are in, so while they run the age can pass 60 seconds although the
+  Operator works: the HA bootstrap and the seeding of members (each call to
+  an Instance Manager may take up to 30 seconds), the end of an Instance
+  Manager token overlap (each member is asked about the token one after
+  another, up to 5 seconds each), and a member that refuses the first of two
+  tokens (the role query is sent twice). A reader that sees a stale status
+  during these phases sees it correctly as "not observed recently", not as
+  a stopped Operator; the Operator's log and Events tell which it is.
 - A member whose `lastObservedTime` is older than the cluster's did not answer
-  the observations in between; its role is then `unknown`.
+  in the observation the cluster's time comes from; its role is then
+  `unknown`.
 - The fields are not set for a cluster without HA or without role discovery,
   whose roles are never observed. No metric exports these times.
 - A Condition's `lastTransitionTime` is when its status last changed, not when
