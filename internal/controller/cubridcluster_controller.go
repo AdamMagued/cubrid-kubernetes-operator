@@ -145,6 +145,8 @@ type CubridClusterReconciler struct {
 // an Event for a status that was not written would be recorded again by the
 // reconcile that writes it (docs/observability.md).
 type reconcileReport struct {
+	// before is the status the reconcile started from, as it is stored.
+	before *databasev1alpha1.CubridClusterStatus
 	// statusWritten says that the last write of the status succeeded.
 	statusWritten bool
 	events        []pendingEvent
@@ -155,7 +157,7 @@ type pendingEvent struct{ eventType, reason, message string }
 // beginReport starts the report of a reconcile of cluster. One reconcile runs
 // per cluster at a time.
 func (r *CubridClusterReconciler) beginReport(cluster *databasev1alpha1.CubridCluster) *reconcileReport {
-	report := &reconcileReport{}
+	report := &reconcileReport{before: cluster.Status.DeepCopy()}
 	r.reports.Store(client.ObjectKeyFromObject(cluster), report)
 	return report
 }
@@ -194,10 +196,17 @@ func (r *CubridClusterReconciler) statusEvent(cluster *databasev1alpha1.CubridCl
 }
 
 // writeStatus writes the cluster's status and notes for the reconcile's
-// report whether it was written.
+// report whether it was written. A status whose only change from the stored
+// one is a newer observation time keeps the stored times while they are
+// younger than observationWriteInterval (holdObservationTimes), so that the
+// API server finds nothing to write.
 func (r *CubridClusterReconciler) writeStatus(ctx context.Context, cluster *databasev1alpha1.CubridCluster) error {
+	report, ok := r.reports.Load(client.ObjectKeyFromObject(cluster))
+	if ok {
+		holdObservationTimes(report.(*reconcileReport).before, &cluster.Status, r.now())
+	}
 	err := r.Status().Update(ctx, cluster)
-	if report, ok := r.reports.Load(client.ObjectKeyFromObject(cluster)); ok {
+	if ok {
 		report.(*reconcileReport).statusWritten = err == nil
 	}
 	return err
@@ -239,9 +248,8 @@ func (r *CubridClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	// What changed in the status during this reconcile is reported once, when
 	// it ends, if the status was written (docs/observability.md).
-	before := cluster.Status.DeepCopy()
 	report := r.beginReport(&cluster)
-	defer func() { r.endReport(ctx, &cluster, before, report) }()
+	defer func() { r.endReport(ctx, &cluster, report.before, report) }()
 
 	// Reconcile the governing headless Service (ADR-0004: stable per-pod DNS).
 	if err := r.reconcileHeadlessService(ctx, &cluster); err != nil {

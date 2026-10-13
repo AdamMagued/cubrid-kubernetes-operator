@@ -550,12 +550,14 @@ status:
   observedGeneration: 7
 
   currentPrimary: production-1     # unset/null when unresolved or ambiguous
+  lastObservedTime: "2026-10-13T08:00:30Z"   # roles of every member last asked
 
   instances:
     - name: production-0
       ordinal: 0
       role: slave
       ready: true
+      lastObservedTime: "2026-10-13T08:00:30Z" # member's last reachable answer
 
     - name: production-1
       ordinal: 1
@@ -592,6 +594,9 @@ status:
 `currentPrimary` is unset and `PrimaryResolved=False` with reason
 `NoPrimaryObserved` or `MultiplePrimariesObserved` (see ADR-0005). The
 operator must never report two `master` roles as a healthy steady state.
+`lastObservedTime` says how old this HA status is: it is written at most
+every 30 seconds for a newer time alone, and the status is stale when it is
+more than 60 seconds old ([docs/observability.md](docs/observability.md#freshness)).
 
 If a `phase` field is kept for convenience:
 

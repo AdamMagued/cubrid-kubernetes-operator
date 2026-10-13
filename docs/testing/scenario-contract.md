@@ -726,7 +726,15 @@ it needs more.
 - **Limit while the Operator is absent, observed on Kind:** nobody updates
   `status`. After the failover it went on naming the former master as
   `currentPrimary` with `PrimaryResolved=True` until the Operator was back.
-  Nothing in the status says how old an observation is.
+- **Staleness while the Operator is absent:** `status.lastObservedTime` does
+  not move during the absence, and the absence lasts until it is older than
+  the reader's threshold of 60 seconds
+  ([observability](../observability.md#freshness)), so that the status says by
+  itself that it is stale; this adds at most a minute after the Operator's
+  last write to the time the Operator is absent. After the Operator returns,
+  the outcome also requires `status.lastObservedTime` to be no older than the
+  return and within the threshold. The status read during the absence,
+  with the age of the time, is recorded as `statusDuringAbsence`.
 - **Must never happen:** the Operator restoring the old master's role; a
   planned shutdown issued from stale status.
 - **Data check:** all data rules on all three members.

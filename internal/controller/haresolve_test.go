@@ -195,6 +195,54 @@ func TestWriteRoutingEntersAndLeavesQuarantine(t *testing.T) {
 	}
 }
 
+// A stored observation time is kept only while nothing else changes, it is
+// younger than observationWriteInterval, and the new time does not go back.
+func TestHoldObservationTimes(t *testing.T) {
+	stamp := func(at time.Time) *metav1.Time { m := metav1.NewTime(at); return &m }
+	stored := func() *databasev1alpha1.CubridClusterStatus {
+		return &databasev1alpha1.CubridClusterStatus{
+			CurrentPrimary:   c0,
+			LastObservedTime: stamp(testNow),
+			Instances: []databasev1alpha1.InstanceStatus{{Name: c0, Role: databasev1alpha1.RoleMaster,
+				LastObservedTime: stamp(testNow)}},
+		}
+	}
+	current := func(at time.Time) *databasev1alpha1.CubridClusterStatus {
+		s := stored()
+		s.LastObservedTime = stamp(at)
+		s.Instances[0].LastObservedTime = stamp(at)
+		return s
+	}
+	changed := current(testNow.Add(10 * time.Second))
+	changed.CurrentPrimary = ""
+	cases := []struct {
+		name   string
+		status *databasev1alpha1.CubridClusterStatus
+		now    time.Time
+		want   time.Time
+	}{
+		{"within the interval", current(testNow.Add(10 * time.Second)), testNow.Add(10 * time.Second), testNow},
+		{"after the interval", current(testNow.Add(observationWriteInterval)), testNow.Add(observationWriteInterval),
+			testNow.Add(observationWriteInterval)},
+		{"the clock went back", current(testNow.Add(-time.Second)), testNow.Add(-time.Second), testNow.Add(-time.Second)},
+		{"something else changed", changed, testNow.Add(10 * time.Second), testNow.Add(10 * time.Second)},
+	}
+	for _, tc := range cases {
+		holdObservationTimes(stored(), tc.status, tc.now)
+		if !tc.status.LastObservedTime.Equal(stamp(tc.want)) || !tc.status.Instances[0].LastObservedTime.Equal(stamp(tc.want)) {
+			t.Errorf("%s: times = %v, %v, want %v", tc.name, tc.status.LastObservedTime,
+				tc.status.Instances[0].LastObservedTime, tc.want)
+		}
+	}
+
+	first := current(testNow)
+	holdObservationTimes(&databasev1alpha1.CubridClusterStatus{CurrentPrimary: c0,
+		Instances: []databasev1alpha1.InstanceStatus{{Name: c0, Role: databasev1alpha1.RoleMaster}}}, first, testNow)
+	if first.LastObservedTime == nil || first.Instances[0].LastObservedTime == nil {
+		t.Errorf("a first observation was not written: %+v", first)
+	}
+}
+
 func findCondition(cluster *databasev1alpha1.CubridCluster, condType string) *metav1.Condition {
 	for i := range cluster.Status.Conditions {
 		if cluster.Status.Conditions[i].Type == condType {
