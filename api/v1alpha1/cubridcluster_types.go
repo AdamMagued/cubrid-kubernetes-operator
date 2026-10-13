@@ -162,13 +162,67 @@ type CubridStorage struct {
 	RetentionPolicy string `json:"retentionPolicy,omitempty"`
 }
 
+// The accepted form of spec.bootstrap.recovery.manifestUri, and of the
+// bucket and prefix a CubridBackup is written under (ADR-0008). The
+// XValidation markers on RecoverySource.ManifestURI and
+// ObjectStorageDestination carry these expressions verbatim, and the operator
+// applies the same ones before it restores or backs up, so the API server and
+// the operator accept the same URIs.
+const (
+	// S3BucketPattern is a bucket name: 3 to 63 lower-case letters, digits,
+	// dots and hyphens that starts and ends with a letter or digit. A bucket
+	// name has no two adjacent dots either (S3BucketAdjacentDotsPattern).
+	S3BucketPattern = `[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]`
+	// S3BucketAdjacentDotsPattern must not match a bucket name.
+	S3BucketAdjacentDotsPattern = `[.][.]`
+	// S3KeySegmentPattern is one segment of a key prefix: not empty, not "."
+	// or "..", and without "/", "?", "#", "%" or an ASCII whitespace or
+	// control character.
+	S3KeySegmentPattern = `([^/?#%[:space:][:cntrl:]]{3,}|[^./?#%[:space:][:cntrl:]][^/?#%[:space:][:cntrl:]]?|[.][^./?#%[:space:][:cntrl:]])`
+
+	// ManifestURIPattern must match a manifestUri: s3://, a bucket, one or
+	// more prefix segments, and the file name manifest.json.
+	ManifestURIPattern = `^s3://` + S3BucketPattern + `(/` + S3KeySegmentPattern + `)+/manifest[.]json$`
+	// ManifestURIBucketAdjacentDotsPattern must not match a manifestUri.
+	ManifestURIBucketAdjacentDotsPattern = `^s3://[^/]*` + S3BucketAdjacentDotsPattern
+	// ManifestURIMaxLength is the longest manifestUri in characters: s3://,
+	// a 63-character bucket, "/" and 1024 characters of key. S3 limits a key
+	// to 1024 bytes, which the store enforces for a key with non-ASCII
+	// characters.
+	ManifestURIMaxLength = 1093
+
+	// S3BucketNamePattern must match a bucket field.
+	S3BucketNamePattern = `^` + S3BucketPattern + `$`
+	// S3KeyPrefixPattern must match a non-empty CubridBackup destination
+	// prefix: segments separated by single slashes, without a leading slash,
+	// and with at most one trailing slash, which the key written leaves out.
+	S3KeyPrefixPattern = `^` + S3KeySegmentPattern + `(/` + S3KeySegmentPattern + `)*/?$`
+	// S3KeyPrefixMaxLength is the longest CubridBackup destination prefix.
+	// The operator adds the cluster UID, the database and the backup UID
+	// below it, and runs no backup whose artifact URI is longer than
+	// ManifestURIMaxLength.
+	S3KeyPrefixMaxLength = 1024
+)
+
 // RecoverySource points restore-as-bootstrap at an object-storage backup
 // manifest (ADR-0008).
 type RecoverySource struct {
 	// manifestUri is the object-storage URI of the backup manifest.json (the
-	// ADR-0007 artifact identity). Required for recovery bootstrap.
+	// ADR-0007 artifact identity), of the form
+	// s3://<bucket>/<prefix>/manifest.json; the object it names is the one
+	// read. The bucket has 3 to 63 lower-case letters, digits, dots and
+	// hyphens, starts and ends with a letter or digit and has no two adjacent
+	// dots. The prefix has one or more segments; a segment is not empty, not
+	// "." or "..", and has no "/", "?", "#", "%", or ASCII whitespace or
+	// control character, so the URI has no query, fragment or percent
+	// escape. The file name is manifest.json. At most 1093 characters. The
+	// URI CubridBackup status.artifact.uri reports for a backup has this
+	// form. Required for recovery bootstrap.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=1093
+	// +kubebuilder:validation:XValidation:rule="self.matches('^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9](/([^/?#%[:space:][:cntrl:]]{3,}|[^./?#%[:space:][:cntrl:]][^/?#%[:space:][:cntrl:]]?|[.][^./?#%[:space:][:cntrl:]]))+/manifest[.]json$')",message="manifestUri must be s3://<bucket>/<prefix>/manifest.json: a bucket of 3 to 63 lower-case letters, digits, dots and hyphens, a prefix of one or more segments that are not empty, '.' or '..' and have no '?', '#', '%' or ASCII whitespace or control character, and the file name manifest.json"
+	// +kubebuilder:validation:XValidation:rule="!self.matches('^s3://[^/]*[.][.]')",message="the bucket of manifestUri must not contain two adjacent dots"
 	ManifestURI string `json:"manifestUri"`
 }
 
@@ -196,7 +250,9 @@ type CubridObjectStorage struct {
 	// bucket holds the artifacts the operator creates for itself: the backup
 	// the other members of an HA cluster are seeded from. A CubridBackup
 	// names its own bucket. Required for an HA cluster: this is what the
-	// current way of seeding the members needs (ADR-0010).
+	// current way of seeding the members needs (ADR-0010). The seed backups
+	// are never read through a manifestUri, so bucket and prefix are not
+	// held to its rules (ADR-0008).
 	// +optional
 	Bucket string `json:"bucket,omitempty"`
 
