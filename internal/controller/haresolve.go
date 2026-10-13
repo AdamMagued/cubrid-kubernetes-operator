@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	databasev1alpha1 "github.com/cubrid-lab/cubrid-kubernetes-operator/api/v1alpha1"
@@ -40,6 +41,15 @@ const roleObservationTTL = 15 * time.Second
 // without any Kubernetes event. It is below roleObservationTTL, so status
 // never rests on an observation that has expired.
 const haResyncInterval = 10 * time.Second
+
+// observationWriteInterval is how long the stored time of an observation may
+// fall behind before a reconcile that changes nothing else writes the status
+// to advance it (status.lastObservedTime, instances[].lastObservedTime,
+// instances[].replication.observedAt). Without it every haResyncInterval
+// pass would write the cluster for a time alone. It is three resync passes,
+// and twice roleObservationTTL, so that a reader's staleness threshold
+// (docs/observability.md, "Freshness") stays near a minute.
+const observationWriteInterval = 30 * time.Second
 
 // memberNames returns the StatefulSet pod names (<cluster>-<ordinal>, ADR-0004).
 func memberNames(cluster *databasev1alpha1.CubridCluster, count int32) []string {
@@ -76,6 +86,8 @@ func (r *CubridClusterReconciler) reconcileHAStatus(ctx context.Context, cluster
 	res := resolvePrimary(members, obs, now)
 	cluster.Status.CurrentPrimary = res.CurrentPrimary
 	cluster.Status.Instances = instanceStatuses(members, obs, now, cluster.Status.Instances)
+	observedAt := metav1.NewTime(now)
+	cluster.Status.LastObservedTime = &observedAt
 
 	setCondition(cluster, conditionPrimaryResolved, res.Status, res.Reason, primaryResolvedMessage(res))
 	replStatus, replReason, replMessage := replicationCondition(cluster.Status.Instances, obs, now)
@@ -219,12 +231,14 @@ func resolvePrimary(members []string, obs map[string]RoleObservation, now time.T
 // instanceStatuses builds the per-instance status list from observations,
 // preserving the ordinal ordering of members. previous is the list of the
 // reconcile before: a slave's replication is judged against what it reported
-// then.
+// then, and a member that gave no answer keeps the time of its last one.
 func instanceStatuses(members []string, obs map[string]RoleObservation, now time.Time,
 	previous []databasev1alpha1.InstanceStatus) []databasev1alpha1.InstanceStatus {
 	before := make(map[string]*databasev1alpha1.InstanceReplication, len(previous))
+	answered := make(map[string]*metav1.Time, len(previous))
 	for _, in := range previous {
 		before[in.Name] = in.Replication
+		answered[in.Name] = in.LastObservedTime
 	}
 	out := make([]databasev1alpha1.InstanceStatus, 0, len(members))
 	for i, m := range members {
@@ -237,8 +251,17 @@ func instanceStatuses(members []string, obs map[string]RoleObservation, now time
 		// The engine version does not depend on the HA role, so it is kept
 		// from any reachable, fresh answer, also one whose role is not trusted.
 		version := ""
+		lastObserved := answered[m].DeepCopy()
 		if o, ok := obs[m]; ok && fresh(o, now) {
 			version = o.EngineVersion
+		}
+		// The pass's time, which the cluster's lastObservedTime is set to,
+		// not the prober's stamp: an equal time means the member answered in
+		// that pass. An answer that contradicts itself or names another
+		// member is not counted as this member's answer.
+		if o, ok := obs[m]; ok && fresh(o, now) && !o.Conflicting {
+			at := metav1.NewTime(now)
+			lastObserved = &at
 		}
 		// Only an authoritative slave's applier is taken into account. A
 		// slave whose applier could not be read keeps its last reading; a
@@ -255,7 +278,52 @@ func instanceStatuses(members []string, obs map[string]RoleObservation, now time
 			Ready:                 ready,
 			ObservedEngineVersion: version,
 			Replication:           replication,
+			LastObservedTime:      lastObserved,
 		})
 	}
 	return out
+}
+
+// holdObservationTimes puts the stored observation times back into status
+// when nothing but these times would change, so that a reconcile that only
+// observed the same state again does not write the status. A stored time is
+// put back only while it is younger than observationWriteInterval at now;
+// an older one, a time that was not set before, and a time that went back
+// are written. When anything else changed, status keeps all its current
+// times, so a status that is written carries the newest observation.
+func holdObservationTimes(stored, status *databasev1alpha1.CubridClusterStatus, now time.Time) {
+	if stored == nil {
+		return
+	}
+	held := status.DeepCopy()
+	held.LastObservedTime = heldTime(stored.LastObservedTime, held.LastObservedTime, now)
+	before := make(map[string]*databasev1alpha1.InstanceStatus, len(stored.Instances))
+	for i := range stored.Instances {
+		before[stored.Instances[i].Name] = &stored.Instances[i]
+	}
+	for i := range held.Instances {
+		in, prev := &held.Instances[i], before[held.Instances[i].Name]
+		if prev == nil {
+			continue
+		}
+		in.LastObservedTime = heldTime(prev.LastObservedTime, in.LastObservedTime, now)
+		if in.Replication != nil && prev.Replication != nil {
+			in.Replication.ObservedAt = heldTime(prev.Replication.ObservedAt, in.Replication.ObservedAt, now)
+		}
+	}
+	if equality.Semantic.DeepEqual(held, stored) {
+		*status = *held
+	}
+}
+
+// heldTime is the time to keep in place of current: stored, when it is set,
+// not after current, and younger than observationWriteInterval at now.
+func heldTime(stored, current *metav1.Time, now time.Time) *metav1.Time {
+	if stored == nil || current == nil || current.Before(stored) {
+		return current
+	}
+	if age := now.Sub(stored.Time); age < 0 || age >= observationWriteInterval {
+		return current
+	}
+	return stored.DeepCopy()
 }

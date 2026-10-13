@@ -107,11 +107,13 @@ func (r *haRun) identities(members []string) map[string]string {
 	return ids
 }
 
-// statusSnapshot is the conditions and the primary of the CubridCluster as
-// one read returned them.
+// statusSnapshot is the conditions, the primary and the last observation
+// time of the CubridCluster as one read returned them.
 type statusSnapshot struct {
 	primary    string
 	conditions map[string]string
+	// lastObserved is status.lastObservedTime; zero when it is not set.
+	lastObserved time.Time
 }
 
 func (r *haRun) status() (statusSnapshot, error) {
@@ -121,8 +123,9 @@ func (r *haRun) status() (statusSnapshot, error) {
 	}
 	var cluster struct {
 		Status struct {
-			CurrentPrimary string `json:"currentPrimary"`
-			Conditions     []struct {
+			CurrentPrimary   string     `json:"currentPrimary"`
+			LastObservedTime *time.Time `json:"lastObservedTime"`
+			Conditions       []struct {
 				Type   string `json:"type"`
 				Status string `json:"status"`
 			} `json:"conditions"`
@@ -132,6 +135,9 @@ func (r *haRun) status() (statusSnapshot, error) {
 		return statusSnapshot{}, err
 	}
 	s := statusSnapshot{primary: cluster.Status.CurrentPrimary, conditions: map[string]string{}}
+	if cluster.Status.LastObservedTime != nil {
+		s.lastObserved = *cluster.Status.LastObservedTime
+	}
 	for _, c := range cluster.Status.Conditions {
 		s.conditions[c.Type] = c.Status
 	}

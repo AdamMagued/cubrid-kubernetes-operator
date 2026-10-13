@@ -72,16 +72,20 @@ type ReplicationObservation struct {
 // restarted, are not comparable and start a new series.
 //
 // Without a reading (obs nil) the status before is kept unchanged, neither
-// progress nor a stall, until it is older than replicationHistoryTTL. A status
-// before stamped more than roleObservationTTL in the future, as after the
-// clock went back or another Operator instance took over, is no history
-// either.
+// progress nor a stall, until it is older than replicationHistoryTTL. The age
+// is measured from the stored observedAt, which holdObservationTimes keeps up
+// to observationWriteInterval behind the last reading with the same values, so
+// that interval is added: the history lasts at least replicationHistoryTTL
+// and at most replicationHistoryTTL + observationWriteInterval after the last
+// real reading. A status before stamped more than roleObservationTTL
+// in the future, as after the clock went back or another Operator instance
+// took over, is no history either.
 func nextReplication(prev *databasev1alpha1.InstanceReplication, obs *ReplicationObservation,
 	now time.Time) *databasev1alpha1.InstanceReplication {
 	if prev != nil {
 		if prev.ObservedAt == nil {
 			prev = nil
-		} else if age := now.Sub(prev.ObservedAt.Time); age > replicationHistoryTTL || age < -roleObservationTTL {
+		} else if age := now.Sub(prev.ObservedAt.Time); age > replicationHistoryTTL+observationWriteInterval || age < -roleObservationTTL {
 			prev = nil
 		}
 	}

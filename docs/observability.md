@@ -151,19 +151,66 @@ issue decides, these limits apply:
 - **Nothing while the Operator is away.** A stopped Operator, or one that
   cannot reach the API server, changes nothing: the Brokers
   keep their configuration and CUBRID keeps failing over by itself
-  (ADR-0005 section 7). The Conditions keep their last value, and nothing in
-  the status says how old that value is (see [Freshness](#freshness)).
+  (ADR-0005 section 7). The Conditions keep their last value, and
+  `status.lastObservedTime` stops advancing, which is how a reader tells
+  that they are stale (see [Freshness](#freshness)).
 
 ## Freshness
 
-- The status has no field that says when the Operator last observed the
-  members or when a member last answered, and no metric exports such a time.
-  A reader cannot tell from the status alone how old it is. Making freshness
-  observable is issue
-  [#92](https://github.com/cubrid-lab/cubrid-kubernetes-operator/issues/92).
+An HA cluster with role discovery publishes when its HA status was observed:
+
+| Field | Meaning |
+|---|---|
+| `status.lastObservedTime` | When the Operator last asked every member for its role: the observation that `currentPrimary`, `instances[]` and `PrimaryResolved`, `HAReady` and `ReplicationHealthy` were derived from |
+| `status.instances[].lastObservedTime` | The time of the observation in which that member last gave a reachable answer to the role query, whatever role it reported, that did not contradict itself or name another member; the same value as `status.lastObservedTime` for a member that answered in that observation |
+| `status.instances[].replication.observedAt` | When the slave's applier counters were last read |
+
+- **The times only move forward, and are not written on every pass.** The
+  Operator observes the roles every 10 seconds (`haResyncInterval`). A
+  reconcile whose only change would be a newer time keeps the stored time
+  while it is younger than 30 seconds (`observationWriteInterval`), so that an
+  unchanged cluster is not written every 10 seconds. When the status is
+  written for any other reason, it carries the newest times. A stored time
+  can therefore be up to 30 seconds older than the observation it stands
+  for: a member's time understates its last answer by up to that much.
+- **A changing value is written on every pass.** Only the times are held.
+  When anything else in the status changes, for example a slave's applier
+  counters (`appliedChanges`, `delayedPages`) under load, the status is
+  written on every pass, as it was before these fields existed.
+- **A reconcile that does not observe the roles keeps the times.** After a
+  failed step or during a recovery bootstrap the HA Conditions are `Unknown`
+  with `RolesNotObserved`, and the times are neither advanced nor cleared:
+  they still say when the roles were last observed. A member that does not
+  answer keeps the time of its last answer while the others advance.
+- **Reader rule: the HA status is stale when `status.lastObservedTime` is
+  more than 60 seconds old.** While the Operator runs, the stored time can be
+  up to 30 seconds old before a reconcile advances it, the next reconcile
+  comes up to 10 seconds later, and asking the members takes up to 5
+  seconds; 60 seconds leaves a margin over these 45 seconds. A reader
+  compares against its own clock, so clock skew between the reader and the
+  Operator adds to the age. A stale status must not be read as the current
+  state of CUBRID: the Operator may be stopped, unable to reach the API
+  server, or unable to observe the roles.
+- **Passes that take longer.** The 45 seconds assume a pass whose members
+  answer within the role query's timeout. Some passes do more before the
+  roles are asked, and the time of the observation is taken when the
+  answers are in, so while they run the age can pass 60 seconds although the
+  Operator works: the HA bootstrap and the seeding of members (each call to
+  an Instance Manager may take up to 30 seconds), the end of an Instance
+  Manager token overlap (each member is asked about the token one after
+  another, up to 5 seconds each), and a member that refuses the first of two
+  tokens (the role query is sent twice). A reader that sees a stale status
+  during these phases sees it correctly as "not observed recently", not as
+  a stopped Operator; the Operator's log and Events tell which it is.
+- A member whose `lastObservedTime` is older than the cluster's did not answer
+  in the observation the cluster's time comes from; its role is then
+  `unknown`.
+- The fields are not set for a cluster without HA or without role discovery,
+  whose roles are never observed. No metric exports these times.
 - A Condition's `lastTransitionTime` is when its status last changed, not when
   it was last confirmed.
-- No Condition says "stale", because nobody would be there to set it.
+- No Condition says "stale", because nobody would be there to set it; the age
+  of `status.lastObservedTime` says it instead.
 
 ## Transitions
 
@@ -292,7 +339,8 @@ what a collector can pick up later without a change here.
 
 | Part | Issue |
 |---|---|
-| This contract, freshness in the status, Conditions checked against the scenarios | [#92](https://github.com/cubrid-lab/cubrid-kubernetes-operator/issues/92) |
+| This contract, Conditions checked against the scenarios | [#92](https://github.com/cubrid-lab/cubrid-kubernetes-operator/issues/92) |
+| Freshness in the status | [#370](https://github.com/cubrid-lab/cubrid-kubernetes-operator/issues/370) |
 | Instance Manager logs | [#250](https://github.com/cubrid-lab/cubrid-kubernetes-operator/issues/250) |
 | Operator transition logs and Events | [#251](https://github.com/cubrid-lab/cubrid-kubernetes-operator/issues/251) |
 | CUBRID's own log files | [#252](https://github.com/cubrid-lab/cubrid-kubernetes-operator/issues/252) |

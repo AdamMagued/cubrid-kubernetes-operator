@@ -338,6 +338,16 @@ type InstanceStatus struct {
 	// could not be read.
 	// +optional
 	Replication *InstanceReplication `json:"replication,omitempty"`
+	// lastObservedTime is the time of the observation in which this member
+	// last gave the operator a reachable answer to its role query that did not
+	// contradict itself or name another member, whatever role it reported: the
+	// cluster's lastObservedTime when it answered in that observation. A
+	// member that does not answer, or answers so, keeps the time of its last
+	// answer. A newer value of this time alone is written at most every
+	// 30 seconds, so it can understate the last answer by up to that much
+	// (docs/observability.md, "Freshness").
+	// +optional
+	LastObservedTime *metav1.Time `json:"lastObservedTime,omitempty"`
 }
 
 // InstanceReplication reports how a slave's log applier is doing (ADR-0006).
@@ -363,7 +373,9 @@ type InstanceReplication struct {
 	// as soon as the applier applies something or no page waits.
 	// +optional
 	StalledSince *metav1.Time `json:"stalledSince,omitempty"`
-	// observedAt is when the operator last read these counters.
+	// observedAt is when the operator last read these counters. A reading
+	// with the same values as the stored one advances it at most every 30
+	// seconds.
 	// +optional
 	ObservedAt *metav1.Time `json:"observedAt,omitempty"`
 }
@@ -463,6 +475,18 @@ type CubridClusterStatus struct {
 	// update reports rolling-update progress (ADR-0009).
 	// +optional
 	Update *UpdateStatus `json:"update,omitempty"`
+
+	// lastObservedTime is when the operator last asked every member of an HA
+	// cluster for its role: the observation that currentPrimary, instances and
+	// the PrimaryResolved, HAReady and ReplicationHealthy conditions were
+	// derived from. A reconcile that ends before the roles are observed keeps
+	// it, and so does a stopped operator, so its age tells how old the HA
+	// status is. A newer value of this time alone is written at most every 30
+	// seconds: the HA status is stale when this time is more than 60 seconds
+	// old (docs/observability.md, "Freshness"). Unset while the roles of the
+	// cluster have never been observed.
+	// +optional
+	LastObservedTime *metav1.Time `json:"lastObservedTime,omitempty"`
 }
 
 // UpdateStatus reports database-aware rolling-update progress (ADR-0009).

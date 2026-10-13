@@ -48,6 +48,10 @@ const (
 	operatorSelector   = "control-plane=controller-manager"
 )
 
+// statusStaleAfter is the reader's rule of docs/observability.md
+// ("Freshness"): the HA status is stale when status.lastObservedTime is older.
+const statusStaleAfter = 60 * time.Second
+
 // operatorPods lists the Operator's Pods as "name uid" lines, also those
 // that are being deleted.
 func operatorPods(ctx context.Context) ([]string, error) {
@@ -302,7 +306,8 @@ func (r *haRun) s06Absent() {
 	By("removing the Operator, then deleting the master Pod while it is absent")
 	absence := &operatorAbsence{}
 	var newMaster, staleStatus, membersBeforeReturn string
-	var masterDeletedAt time.Time
+	var masterDeletedAt, lastObservedDuringAbsence time.Time
+	var ageBeforeAbsence time.Duration
 	outcome := r.runFault(faults.Scenario{
 		Fault:  absence,
 		Limits: s03FlowLimits,
@@ -310,7 +315,21 @@ func (r *haRun) s06Absent() {
 			if !operatorAvailable() {
 				return fmt.Errorf("the Operator is not available")
 			}
-			_, err := r.formationTime()
+			// The status is fresh while the Operator runs, also on a cluster
+			// in which nothing changes: otherwise a stale one during the
+			// absence would prove nothing.
+			s, err := r.status()
+			if err != nil {
+				return err
+			}
+			if s.lastObserved.IsZero() {
+				return fmt.Errorf("status.lastObservedTime is not set while the Operator runs")
+			}
+			if ageBeforeAbsence = time.Since(s.lastObserved); ageBeforeAbsence > statusStaleAfter {
+				return fmt.Errorf("status.lastObservedTime is %s old while the Operator runs, more than %s",
+					ageBeforeAbsence.Round(time.Second), statusStaleAfter)
+			}
+			_, err = r.formationTime()
 			return err
 		},
 		Check: func(ctx context.Context) (bool, error) {
@@ -347,10 +366,28 @@ func (r *haRun) s06Absent() {
 			if !r.lastAnswerAcknowledged(client) {
 				return false, nil
 			}
-			// What the status says while nobody maintains it.
-			if s, err := r.status(); err == nil {
-				staleStatus = fmt.Sprintf("currentPrimary=%s PrimaryResolved=%s", s.primary, s.conditions["PrimaryResolved"])
+			// What the status says while nobody maintains it: its last
+			// observation time stays where the Operator left it, and the
+			// absence lasts until a reader can tell from it that it is stale.
+			s, err := r.status()
+			if err != nil {
+				return false, nil
 			}
+			if s.lastObserved.IsZero() {
+				return false, fmt.Errorf("status.lastObservedTime is not set")
+			}
+			if lastObservedDuringAbsence.IsZero() {
+				lastObservedDuringAbsence = s.lastObserved
+			} else if !s.lastObserved.Equal(lastObservedDuringAbsence) {
+				return false, fmt.Errorf("status.lastObservedTime moved from %s to %s while no Operator ran",
+					lastObservedDuringAbsence.Format(time.RFC3339), s.lastObserved.Format(time.RFC3339))
+			}
+			age := time.Since(s.lastObserved)
+			if age <= statusStaleAfter {
+				return false, nil
+			}
+			staleStatus = fmt.Sprintf("currentPrimary=%s PrimaryResolved=%s lastObservedTime=%s age=%s",
+				s.primary, s.conditions["PrimaryResolved"], s.lastObserved.Format(time.RFC3339), age.Round(time.Second))
 			membersBeforeReturn, err = r.memberUIDs()
 			return err == nil, nil
 		},
@@ -364,12 +401,16 @@ func (r *haRun) s06Absent() {
 	Expect(outcome.Result).To(Equal(evidence.Pass), "S06/%s: %s", s06Absent, outcome.Reason)
 	Expect(outcome.CleanupSucceeded).To(BeTrue(), "the Operator's Deployment was not scaled back")
 
-	By("waiting for the returned Operator to report the new master")
+	By("waiting for the returned Operator to report the new master from a fresh observation")
 	Eventually(func(g Gomega) {
 		g.Expect(operatorAvailable()).To(BeTrue(), "the Operator is available")
 		s, err := r.status()
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(s.primary).To(Equal(newMaster), "status.currentPrimary")
+		// The API server stores the time to the second.
+		g.Expect(s.lastObserved).To(BeTemporally(">=", absence.returnedAt.Truncate(time.Second)),
+			"status.lastObservedTime is not newer than the Operator's return")
+		g.Expect(time.Since(s.lastObserved)).To(BeNumerically("<=", statusStaleAfter), "status.lastObservedTime is stale")
 		_, err = r.formationTime()
 		g.Expect(err).NotTo(HaveOccurred())
 	}, 5*time.Minute, time.Second).Should(Succeed())
@@ -420,6 +461,8 @@ func (r *haRun) s06Absent() {
 			"stableFor":           stable.Round(time.Millisecond).String(),
 			"operatorAbsentFor":   absence.returnedAt.Sub(outcome.FaultIssuedAt).Round(time.Millisecond).String(),
 			"statusDuringAbsence": staleStatus,
+			// Just before the absence, while the Operator ran.
+			"lastObservedAgeBeforeAbsence": ageBeforeAbsence.Round(time.Second).String(),
 			// After it was started again: until the status named the new
 			// master with every condition True.
 			"operatorResyncTime":       resync.Round(time.Millisecond).String(),

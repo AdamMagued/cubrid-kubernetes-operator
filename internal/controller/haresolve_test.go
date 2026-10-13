@@ -195,6 +195,97 @@ func TestWriteRoutingEntersAndLeavesQuarantine(t *testing.T) {
 	}
 }
 
+// A member that answered in a pass carries the pass's time, the time the
+// cluster's lastObservedTime is set to, also when its answer was stamped
+// earlier by the prober: an equal time means "answered in that pass". A
+// member that did not answer keeps its time from before.
+func TestInstanceStatuses_LastObservedTimeIsThePass(t *testing.T) {
+	members := []string{c0, c1}
+	earlier := metav1.NewTime(testNow.Add(-time.Minute))
+	previous := []databasev1alpha1.InstanceStatus{{Name: c0, LastObservedTime: &earlier},
+		{Name: c1, LastObservedTime: &earlier}}
+	answered := master()
+	answered.ObservedAt = testNow.Add(-1500 * time.Millisecond)
+	obs := map[string]RoleObservation{c0: answered, c1: unreach()}
+	got := instanceStatuses(members, obs, testNow, previous)
+	if at := got[0].LastObservedTime; at == nil || !at.Time.Equal(testNow) {
+		t.Errorf("member that answered: lastObservedTime = %v, want the pass's time %v", at, testNow)
+	}
+	if at := got[1].LastObservedTime; at == nil || !at.Time.Equal(earlier.Time) {
+		t.Errorf("member that did not answer: lastObservedTime = %v, want %v", at, earlier)
+	}
+
+	// An answer that contradicts itself or names another member is no
+	// answer of this member: its time is kept.
+	obs[c1] = conflicting(slave())
+	if at := instanceStatuses(members, obs, testNow, previous)[1].LastObservedTime; at == nil || !at.Time.Equal(earlier.Time) {
+		t.Errorf("member with a conflicting answer: lastObservedTime = %v, want %v", at, earlier)
+	}
+}
+
+// A stored observation time is kept only while nothing else changes, it is
+// younger than observationWriteInterval, and the new time does not go back.
+// When any time is written, all of them are current.
+func TestHoldObservationTimes(t *testing.T) {
+	stamp := func(at time.Time) *metav1.Time { m := metav1.NewTime(at); return &m }
+	// status is a master c0 and a slave c1 whose applier was read, observed
+	// at the given times; members limits the members to the ones named.
+	status := func(cluster, member, applier time.Time, members ...string) *databasev1alpha1.CubridClusterStatus {
+		s := &databasev1alpha1.CubridClusterStatus{CurrentPrimary: c0, LastObservedTime: stamp(cluster)}
+		for _, m := range members {
+			in := databasev1alpha1.InstanceStatus{Name: m, Role: databasev1alpha1.RoleSlave, LastObservedTime: stamp(member),
+				Replication: &databasev1alpha1.InstanceReplication{Source: c0, AppliedChanges: 10, ObservedAt: stamp(applier)}}
+			if m == c0 {
+				in.Role, in.Replication = databasev1alpha1.RoleMaster, nil
+			}
+			s.Instances = append(s.Instances, in)
+		}
+		return s
+	}
+	both := []string{c0, c1}
+	stored := status(testNow, testNow, testNow, both...)
+	at := func(d time.Duration) time.Time { return testNow.Add(d) }
+	// The API server stores whole seconds; the current times do not have to be.
+	soon := at(10*time.Second + 500*time.Millisecond)
+	changed := status(soon, soon, soon, both...)
+	changed.CurrentPrimary = ""
+	cases := []struct {
+		name           string
+		stored, status *databasev1alpha1.CubridClusterStatus
+		now, want      time.Time
+	}{
+		{"within the interval", stored, status(soon, soon, soon, both...), soon, testNow},
+		{"after the interval", stored, status(at(observationWriteInterval), at(observationWriteInterval),
+			at(observationWriteInterval), both...), at(observationWriteInterval), at(observationWriteInterval)},
+		{"only the applier's time moved", stored, status(testNow, testNow, soon, both...), soon, testNow},
+		{"the clock went back", stored, status(at(-time.Second), at(-time.Second), at(-time.Second), both...),
+			at(-time.Second), at(-time.Second)},
+		{"something else changed", stored, changed, soon, soon},
+		{"the cluster's time is due while a member's is not",
+			status(at(-observationWriteInterval), at(-5*time.Second), at(-5*time.Second), both...),
+			status(soon, soon, soon, both...), soon, soon},
+		{"a member was added", status(testNow, testNow, testNow, c0), status(soon, soon, soon, both...), soon, soon},
+		{"a member was removed", stored, status(soon, soon, soon, c0), soon, soon},
+		{"a first observation", &databasev1alpha1.CubridClusterStatus{CurrentPrimary: c0}, status(soon, soon, soon, both...),
+			soon, soon},
+	}
+	for _, tc := range cases {
+		holdObservationTimes(tc.stored, tc.status, tc.now)
+		want := stamp(tc.want)
+		if !tc.status.LastObservedTime.Equal(want) {
+			t.Errorf("%s: lastObservedTime = %v, want %v", tc.name, tc.status.LastObservedTime, want)
+		}
+		for _, in := range tc.status.Instances {
+			if !in.LastObservedTime.Equal(want) {
+				t.Errorf("%s: %s lastObservedTime = %v, want %v", tc.name, in.Name, in.LastObservedTime, want)
+			}
+			if in.Replication != nil && !in.Replication.ObservedAt.Equal(want) {
+				t.Errorf("%s: %s replication.observedAt = %v, want %v", tc.name, in.Name, in.Replication.ObservedAt, want)
+			}
+		}
+	}
+}
+
 func findCondition(cluster *databasev1alpha1.CubridCluster, condType string) *metav1.Condition {
 	for i := range cluster.Status.Conditions {
 		if cluster.Status.Conditions[i].Type == condType {
