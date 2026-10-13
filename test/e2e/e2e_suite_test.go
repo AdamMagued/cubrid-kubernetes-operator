@@ -23,7 +23,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -102,6 +104,17 @@ var _ = AfterSuite(func() {
 	Expect(err).NotTo(HaveOccurred(), "The run did not pass its required scenarios")
 })
 
+// installTime is how long the Operator took to become available: from the
+// creationTimestamp of its Deployment to the lastTransitionTime of the
+// Deployment's Available condition, both as the API server recorded them, in
+// whole seconds. Building and applying the manifests is not included.
+// installMeasured is false when it could not be read. S00 is judged by it
+// (install_limit).
+var (
+	installTime     time.Duration
+	installMeasured bool
+)
+
 // deployManager creates the manager's namespace with the restricted security
 // policy, installs the CRDs and deploys the controller.
 func deployManager() {
@@ -125,6 +138,27 @@ func deployManager() {
 	cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage))
 	_, err = utils.Run(cmd)
 	Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+
+	// Measured, not asserted here: the manager's own specs check its Pod,
+	// and a wait that ends without it leaves the time unmeasured.
+	By("measuring the time until the controller-manager is available")
+	cmd = exec.Command("kubectl", "-n", namespace, "wait", "--for=condition=Available",
+		operatorDeployment, "--timeout=5m")
+	if _, err := utils.Run(cmd); err != nil {
+		return
+	}
+	cmd = exec.Command("kubectl", "-n", namespace, "get", operatorDeployment, "-o",
+		`jsonpath={.metadata.creationTimestamp} {.status.conditions[?(@.type=="Available")].lastTransitionTime}`)
+	out, err := utils.Run(cmd)
+	if err != nil {
+		return
+	}
+	created, available, found := strings.Cut(strings.TrimSpace(out), " ")
+	createdAt, errCreated := time.Parse(time.RFC3339, created)
+	availableAt, errAvailable := time.Parse(time.RFC3339, available)
+	if found && errCreated == nil && errAvailable == nil && !availableAt.Before(createdAt) {
+		installTime, installMeasured = availableAt.Sub(createdAt), true
+	}
 }
 
 // undeployManager removes what deployManager and the metrics check created.

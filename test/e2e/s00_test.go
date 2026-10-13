@@ -52,6 +52,8 @@ type s00Evidence struct {
 	PodUID              string   `json:"podUID,omitempty"`
 	FirstStartSeconds   float64  `json:"firstStartToReadySeconds,omitempty"`
 	RestartSeconds      float64  `json:"podDeleteToReadySeconds,omitempty"`
+	InstallSeconds      float64  `json:"installSeconds,omitempty"`
+	ReadySeconds        float64  `json:"createdToSQLSeconds,omitempty"`
 	ContainerRestarts   string   `json:"containerRestarts,omitempty"`
 	ProbeFailureEvents  []string `json:"probeFailureEvents"`
 	RowKeptAcrossDelete bool     `json:"rowKeptAcrossPodDelete"`
@@ -78,6 +80,8 @@ func s00Scenario() {
 		podReplaced := false
 		// podDeletionOutcome is the run of the Pod deletion, once it happened.
 		var podDeletionOutcome *faults.Outcome
+		// createdAt is when the CubridCluster was created.
+		var createdAt time.Time
 
 		kubectl := func(args ...string) (string, error) {
 			return utils.Run(exec.Command("kubectl", append([]string{"-n", s00Namespace}, args...)...))
@@ -140,6 +144,7 @@ spec:
 `, clusterName, s00Namespace, repository, tag, database)
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(manifest)
+			createdAt = time.Now()
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create the CubridCluster")
 		})
@@ -169,11 +174,16 @@ spec:
 				out, _ := kubectl(args...)
 				_, _ = fmt.Fprintf(GinkgoWriter, "%v:\n%s\n", args, out)
 			}
+			if installMeasured {
+				record.InstallSeconds = installTime.Seconds()
+			}
 			result := evidence.Scenario{ID: "S00", Result: evidence.Result(record.Result),
 				FaultConfirmed: &podReplaced,
 				Measurements: map[string]any{
 					"firstStartToReadySeconds": measured(record.FirstStartSeconds),
 					"podDeleteToReadySeconds":  measured(record.RestartSeconds),
+					"installSeconds":           measured(record.InstallSeconds),
+					"createdToSQLSeconds":      measured(record.ReadySeconds),
 				}}
 			if result.Result != evidence.Pass {
 				result.Reason = "a step of the scenario failed; see the test output"
@@ -193,6 +203,10 @@ spec:
 					result.Evidence = append(result.Evidence, file)
 				}
 			}
+			ready := time.Duration(record.ReadySeconds * float64(time.Second))
+			result = faults.JudgeS00Limits(result,
+				faults.Bound{Limit: installLimit, Measured: installTime, Unmeasured: !installMeasured},
+				faults.Bound{Limit: readyLimit, Measured: ready, Unmeasured: record.ReadySeconds == 0})
 			recordScenario(result)
 			updateSummary(func(s *evidence.Summary) {
 				s.Environment.CubridImageDigest = record.InstanceManagerID
@@ -228,6 +242,8 @@ spec:
 			sql := csqlInPod(s00Namespace, pod, database)
 			Expect(writeS00Row(sql, marker)).To(Succeed())
 			Expect(readS00Row(sql, marker)).To(Succeed())
+			// An upper bound: it includes the checks above.
+			record.ReadySeconds = time.Since(createdAt).Seconds()
 
 			By("checking that a failing statement fails the check")
 			_, err = runSQL(sql, "SELECT * FROM s00_no_such_table;")

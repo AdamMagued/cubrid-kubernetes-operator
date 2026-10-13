@@ -241,7 +241,10 @@ kept in one table, [Time limits](#time-limits), and are set after a baseline
 measurement and before the final test campaigns. A limit is not relaxed after
 a failed run to obtain a pass: a change needs its own reviewed commit with the
 measurements that justify it. A run against a limit that is not set yet is a
-baseline run and ends as `blocked` with reason `time_limit_unset`.
+baseline run and ends as `blocked` with reason `time_limit_unset`. How the
+suite treats S00's `install_limit` and `ready_limit`, which have no value
+while S00 is required, is an open question (#292), described under
+[Time limits](#time-limits-1).
 
 A step of a scenario that reaches its limit is cancelled, and the run waits
 for it to return before it goes on, so that a step neither runs a command nor
@@ -425,6 +428,13 @@ reader can tell what to expect.
 - `result` is one of the five results above; `reason` is required for every
   result except `pass`.
 - A measurement that was not taken has the string value `"unknown"`.
+- `limits` lists every limit the scenario was judged by, with `"unset"` for
+  one that has no value ([Time limits](#time-limits-1)).
+- In S00, `measurements.timeLimitVerdict` is the result, with its reason,
+  that `install_limit` and `ready_limit` give under the rules of
+  [Time limits](#time-limits-1), for example `"blocked: time_limit_unset"`
+  or `"pass"`. It is recorded only when S00's checks all held, and is not
+  S00's result: see the open question there.
 - `neverEvents` lists every must-never-happen outcome that was observed. A
   non-empty list means `fail`.
 - `faultConfirmed` is left out for a scenario that injects no fault.
@@ -757,7 +767,7 @@ it needs more.
 - **Must never happen:** the Operator restoring the old master's role; a
   planned shutdown issued from stale status.
 - **Data check:** all data rules on all three members.
-- **Limits:** `failover_limit`, `operator_resync_limit`.
+- **Limits:** `failover_limit`, `operator_resync_limit`, `stable_period`.
 - **Source note:** no outside test was read; the contract comes from
   ADR-0005.
 
@@ -1040,33 +1050,63 @@ VM lab gets its own values from its own baseline.
 The values below are the defaults of the Kind suite. Each can be set for
 another environment without changing the code, through an environment
 variable that holds a duration such as `45s` or `2m`:
-`E2E_FORMATION_LIMIT`, `E2E_REPLICATION_LIMIT`, `E2E_FAILOVER_LIMIT`,
-`E2E_REJOIN_LIMIT`, `E2E_STABLE_PERIOD`, `E2E_BROKER_RECOVERY_LIMIT` and
+`E2E_INSTALL_LIMIT`, `E2E_READY_LIMIT`, `E2E_FORMATION_LIMIT`,
+`E2E_REPLICATION_LIMIT`, `E2E_FAILOVER_LIMIT`, `E2E_REJOIN_LIMIT`,
+`E2E_STABLE_PERIOD`, `E2E_BROKER_RECOVERY_LIMIT` and
 `E2E_OPERATOR_RESYNC_LIMIT`. The value `0` or `unset` runs the scenario as a
-baseline, which is reported as `blocked`. A value that is not a duration
-stops the suite before it starts. The limit a scenario was judged by is in
-its entry of `summary.json`, so a run with other limits cannot be mistaken
-for one with the defaults.
+baseline, which is reported as `blocked`. A value that is not a duration,
+or is negative, stops the suite before it starts. The limit a scenario was
+judged by is in its entry of `summary.json`, with `unset` for one that has
+no value, so a run with other limits cannot be mistaken for one with the
+defaults.
 
-| Limit | Meaning | Value |
-|---|---|---|
-| `install_limit` | Operator installed and its Pod available | unset |
-| `ready_limit` | Single-member cluster created until SQL succeeds | unset |
-| `formation_limit` | Three-member cluster created until all conditions are `True` | Kind on a GitHub-hosted runner: 5 minutes. VM lab: unset |
-| `replication_limit` | Commit on the master until every slave returns the row | Kind on a GitHub-hosted runner: 30 seconds. VM lab: unset |
-| `failover_limit` | Start of the fault until a write through the read-write endpoint succeeds | Kind on a GitHub-hosted runner: 30 seconds. VM lab: unset |
-| `stable_period` | How long SQL must keep succeeding before recovery is counted | 30 seconds |
-| `rejoin_limit` | Member available again until it holds all rows as a slave | Kind on a GitHub-hosted runner: 5 minutes, measured from the start of the fault. VM lab: unset |
-| `vm_return_limit` | VM powered on until its member has rejoined | unset |
-| `broker_recovery_limit` | Broker Pods killed until a new connection succeeds | Kind on a GitHub-hosted runner: 1 minute. VM lab: unset |
-| `operator_resync_limit` | Operator started until status matches fresh observations | Kind on a GitHub-hosted runner: 2 minutes. VM lab: unset |
-| `quarantine_limit` | Ambiguous observation until new read-write connections stop succeeding | unset |
-| `partition_duration` | How long the partition is held | unset |
-| `rebuild_limit` | Rebuild requested until the member holds all rows | unset |
-| `backup_limit` | Backup requested until `Completed` or `Failed` | unset |
-| `restore_limit` | Recovery cluster created until `Ready` | unset |
-| `delete_limit` | Cluster deleted until its resources are gone | unset |
-| `drain_limit` | Drain issued until it finishes or is refused | unset |
+A run whose checks all held is judged by all its limits together
+(`faults.Judge` in `test/faults`, unit-tested without a cluster):
+
+1. A measurement beyond a limit that is set is `fail`, and so is a time
+   without interruption shorter than a `stable_period` that is set; the
+   first such limit is named in the reason. A limit that is not set does not
+   hide one that was exceeded.
+2. Otherwise a limit that is not set, `stable_period` included, makes the
+   run a baseline: `blocked` with `time_limit_unset`, never `pass`. A
+   `stable_period` of zero would let any recovery count at once.
+3. Otherwise a limit that is set but whose measurement could not be taken
+   makes the run `blocked` with reason `measurement_missing`; the missing
+   measurement is `"unknown"` in the scenario's `measurements`.
+4. Otherwise the run passes.
+
+The Basis column says where a value comes from: **measured** values were
+set from the runs in [Baselines](#baselines); a **choice** was not
+measured; **unset** limits have neither a value nor a baseline.
+
+| Limit | Meaning | Value | Basis |
+|---|---|---|---|
+| `install_limit` | Operator installed and its Pod available | unset | unset; S00 records `installSeconds`: from the `creationTimestamp` of the Operator's Deployment to the `lastTransitionTime` of its `Available` condition, as the API server recorded them, in whole seconds; building and applying the manifests is not included |
+| `ready_limit` | Single-member cluster created until SQL succeeds | unset | unset; S00 records `createdToSQLSeconds`: from just before the `CubridCluster` is applied until a row was written and read through csql, an upper bound that includes the checks before that SQL |
+| `formation_limit` | Three-member cluster created until all conditions are `True` | Kind on a GitHub-hosted runner: 5 minutes. VM lab: unset | Kind: measured |
+| `replication_limit` | Commit on the master until every slave returns the row | Kind on a GitHub-hosted runner: 30 seconds. VM lab: unset | Kind: measured with the earlier method; the current method has no baseline yet |
+| `failover_limit` | Start of the fault until a write through the read-write endpoint succeeds | Kind on a GitHub-hosted runner: 30 seconds. VM lab: unset | Kind: measured |
+| `stable_period` | How long SQL must keep succeeding before recovery is counted | 30 seconds | choice |
+| `rejoin_limit` | Member available again until it holds all rows as a slave | Kind on a GitHub-hosted runner: 5 minutes, measured from the start of the fault. VM lab: unset | Kind: measured |
+| `vm_return_limit` | VM powered on until its member has rejoined | unset | unset |
+| `broker_recovery_limit` | Broker Pods killed until a new connection succeeds | Kind on a GitHub-hosted runner: 1 minute. VM lab: unset | Kind: measured |
+| `operator_resync_limit` | Operator started until status matches fresh observations | Kind on a GitHub-hosted runner: 2 minutes. VM lab: unset | Kind: measured |
+| `quarantine_limit` | Ambiguous observation until new read-write connections stop succeeding | unset | unset |
+| `partition_duration` | How long the partition is held | unset | unset |
+| `rebuild_limit` | Rebuild requested until the member holds all rows | unset | unset |
+| `backup_limit` | Backup requested until `Completed` or `Failed` | unset | unset |
+| `restore_limit` | Recovery cluster created until `Ready` | unset | unset |
+| `delete_limit` | Cluster deleted until its resources are gone | unset | unset |
+| `drain_limit` | Drain issued until it finishes or is refused | unset | unset |
+
+**Open question (#292):** `install_limit` and `ready_limit` have no value
+and S00 is required in the `kind` lane, so rule 2 applied to S00 would keep
+every run from passing the lane. Whether to set them from a baseline,
+remove them from S00, or accept a lane that does not pass is a decision for
+the maintainers. The suite (`faults.JudgeS00Limits`) applies rules 1, 3 and
+4 to the S00 limits that are set; a limit that is not set does not change
+S00's result. S00 records both limits, `unset` where they have no value,
+and the verdict all four rules give as the measurement `timeLimitVerdict`.
 
 ### Baselines
 
