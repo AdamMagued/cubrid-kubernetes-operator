@@ -378,6 +378,25 @@ marker (`<db>/.im-operation`, an interrupted `createdb` or `restoredb`) is
 neither created over nor started: the entrypoint runs only the manager, after
 installing an HA member's configuration, and leaves the marker in place.
 
+A standalone member (`SERVER`, bootstrap `new`) creates its database in the
+entrypoint, and the entrypoint writes the same file around that `createdb`,
+with the value `entrypoint-createdb` instead of an operation ID, and removes
+it only when `createdb` exited 0 (#312). On the pinned image an interrupted
+`createdb` leaves volumes behind; before it registered the database in
+`databases.txt` a second `createdb` refuses them with exit 1, and after it
+registered it `cubrid server start` can fail with a fatal log recovery error
+(docs/poc/RESULTS.md, POC-25), either of which ended the entrypoint and
+crash-looped the container. With the marker left by an interrupted or failed
+`createdb`, and for a database directory that holds files without a
+registration and without a marker, the entrypoint creates and starts nothing,
+runs only the manager, and logs what a person has to do. The manager never
+removes such a directory: the value is not an operation ID, so it is never
+its own unfinished work. The way out is the one the log names: stop the
+member, remove `<db>` and its `databases.txt` line, and start it again; the
+server was never started on that data, so no client wrote to it. A
+termination that arrives during that `createdb` is handled when it returns,
+and nothing more is started.
+
 Each cluster has a token of its own (#270). Before it creates the cluster's
 first Pod, the operator generates 256 random bits (hex) into the
 `<cluster>-im-token` Secret (owned by the cluster), and calls each member with

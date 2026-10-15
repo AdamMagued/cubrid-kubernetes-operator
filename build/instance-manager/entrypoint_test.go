@@ -49,8 +49,11 @@ const (
 	callManagerTerm = "manager term"
 	callHeartbeat   = "cubrid heartbeat start"
 
-	// cubridStub records its arguments; `createdb` registers the database the
-	// way the real command does.
+	// cubridStub records its arguments. `createdb` behaves as the real one
+	// does on the pinned image (docs/poc/RESULTS.md, POC-25): it writes its
+	// volumes into the working directory and registers the database in
+	// databases.txt near its end; it refuses, with exit 1 and nothing changed,
+	// when a volume of the database is already there.
 	cubridStub = `#!/bin/bash
 echo "cubrid $*" >> "${CALLS}"
 # CUBRID_START_SECONDS makes a start take that long, as the real one does.
@@ -58,6 +61,25 @@ if [ "$2" = "start" ] && [ -n "${CUBRID_START_SECONDS:-}" ]; then sleep "${CUBRI
 # CUBRID_START_EXIT makes a start fail, as it does on an unfinished database.
 if [ "$2" = "start" ] && [ -n "${CUBRID_START_EXIT:-}" ]; then exit "${CUBRID_START_EXIT}"; fi
 if [ "$1" = "createdb" ]; then
+  [ -e .im-operation ] && cat .im-operation > "${CALLS}.marker"
+  if [ -e "${CUBRID_DB}_lgat" ]; then
+    echo "Volume \"${PWD}/${CUBRID_DB}_lgat\" already exists." >&2
+    exit 1
+  fi
+  : > "${CUBRID_DB}_lgat"
+  # CUBRID_CREATEDB_HANG=unregistered|registered stops createdb before or
+  # after its registration until it is killed, as an interrupted one is.
+  if [ -n "${CUBRID_CREATEDB_HANG:-}" ]; then
+    [ "${CUBRID_CREATEDB_HANG}" = "registered" ] \
+      && printf '%s\t%s\tlocalhost\n' "${CUBRID_DB}" "${PWD}" >> "${CUBRID_DATABASES}/databases.txt"
+    echo $$ > "${CALLS}.createdb.pid"
+    while :; do sleep 0.05; done
+  fi
+  # CUBRID_CREATEDB_SECONDS makes createdb take that long.
+  if [ -n "${CUBRID_CREATEDB_SECONDS:-}" ]; then sleep "${CUBRID_CREATEDB_SECONDS}"; fi
+  # CUBRID_CREATEDB_EXIT makes createdb fail after it wrote a volume.
+  if [ -n "${CUBRID_CREATEDB_EXIT:-}" ]; then exit "${CUBRID_CREATEDB_EXIT}"; fi
+  : > "${CUBRID_DB}"
   printf '%s\t%s\tlocalhost\n' "${CUBRID_DB}" "${PWD}" >> "${CUBRID_DATABASES}/databases.txt"
 fi
 `
@@ -415,6 +437,189 @@ func TestEntrypoint_DanglingMarkerKeepsTheDatabaseStopped(t *testing.T) {
 	if _, err := os.Lstat(marker); err != nil {
 		t.Errorf("the marker was removed: %v", err)
 	}
+}
+
+// entrypointMarker is what the entrypoint writes into the ownership marker
+// around its own createdb: not an operation ID, so that the Instance Manager
+// never takes the directory for one of its own.
+const entrypointMarker = "entrypoint-createdb\n"
+
+// killed ends the entrypoint and the createdb stand-in it is waiting for with
+// SIGKILL, as the loss of the container or the node does.
+func (f *fixture) killed(cmd *exec.Cmd, out *bytes.Buffer) {
+	f.t.Helper()
+	pidFile := f.calls + ".createdb.pid"
+	waitFor(f.t, func() bool { _, err := os.Stat(pidFile); return err == nil }, out)
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	var pid int
+	if _, err := fmt.Sscan(string(data), &pid); err != nil {
+		f.t.Fatalf("createdb pid %q: %v", data, err)
+	}
+	_ = cmd.Process.Kill()
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	_ = waitExit(cmd)
+}
+
+// A standalone createdb that is interrupted, before or after it registered
+// the database, leaves volumes in the database directory (docs/poc/RESULTS.md,
+// POC-25). On the next start the entrypoint neither runs createdb over them
+// (which would fail with exit 1 and crash-loop the container) nor starts
+// the registered, unfinished database (which fails with a fatal log recovery
+// error): it starts only the manager and says what to do. Nothing is
+// removed.
+func TestEntrypoint_InterruptedStandaloneCreatedbIsNotRecreatedOrStarted(t *testing.T) {
+	for _, stage := range []string{"unregistered", "registered"} {
+		t.Run(stage, func(t *testing.T) {
+			f := newFixture(t, managerStub)
+			f.env["CUBRID_CREATEDB_HANG"] = stage
+			cmd := f.command()
+			var out bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &out, &out
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			f.killed(cmd, &out)
+			if data, err := os.ReadFile(f.calls + ".marker"); err != nil || string(data) != entrypointMarker {
+				t.Fatalf("createdb ran without the entrypoint's marker (err=%v): %q", err, data)
+			}
+			if err := os.Remove(f.calls); err != nil {
+				t.Fatal(err)
+			}
+
+			delete(f.env, "CUBRID_CREATEDB_HANG")
+			f.env["CUBRID_START_EXIT"] = "1"
+			code, second := f.run()
+			if code != 0 {
+				t.Fatalf("exit %d:\n%s", code, second)
+			}
+			wantCalls(t, f.recorded(), callManagerStart)
+			dir := filepath.Join(f.databases, dbName)
+			marker := filepath.Join(dir, ".im-operation")
+			if data, err := os.ReadFile(marker); err != nil || string(data) != entrypointMarker {
+				t.Errorf("the marker was not kept as it was (err=%v): %q", err, data)
+			}
+			if _, err := os.Stat(filepath.Join(dir, dbName+"_lgat")); err != nil {
+				t.Errorf("the volume createdb left was removed: %v", err)
+			}
+			for _, want := range []string{"is unfinished (" + marker + ")", "createdb did not complete", "remove " + dir} {
+				if !strings.Contains(second, want) {
+					t.Errorf("the log does not say %q:\n%s", want, second)
+				}
+			}
+		})
+	}
+}
+
+// A createdb that fails leaves its marker: the entrypoint starts nothing but
+// the manager, now and at the next start, instead of exiting and being
+// restarted into a createdb that fails again.
+func TestEntrypoint_FailedStandaloneCreatedbStartsOnlyTheManager(t *testing.T) {
+	f := newFixture(t, managerStub)
+	f.env["CUBRID_CREATEDB_EXIT"] = "1"
+	code, out := f.run()
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	wantCalls(t, f.recorded(), "cubrid createdb", callManagerStart)
+	marker := filepath.Join(f.databases, dbName, ".im-operation")
+	if data, err := os.ReadFile(marker); err != nil || string(data) != entrypointMarker {
+		t.Errorf("the marker was not kept (err=%v): %q", err, data)
+	}
+	if !strings.Contains(out, "createdb did not complete") {
+		t.Errorf("the log does not say that createdb failed:\n%s", out)
+	}
+	if err := os.Remove(f.calls); err != nil {
+		t.Fatal(err)
+	}
+	delete(f.env, "CUBRID_CREATEDB_EXIT")
+	if code, out := f.run(); code != 0 {
+		t.Fatalf("second start: exit %d:\n%s", code, out)
+	}
+	wantCalls(t, f.recorded(), callManagerStart)
+}
+
+// A completed createdb removes the marker, so the next start starts the
+// database.
+func TestEntrypoint_CompletedStandaloneCreatedbClearsTheMarker(t *testing.T) {
+	f := newFixture(t, managerStub)
+	if code, out := f.run(); code != 0 {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	if data, err := os.ReadFile(f.calls + ".marker"); err != nil || string(data) != entrypointMarker {
+		t.Errorf("createdb ran without the entrypoint's marker (err=%v): %q", err, data)
+	}
+	if _, err := os.Lstat(filepath.Join(f.databases, dbName, ".im-operation")); !os.IsNotExist(err) {
+		t.Errorf("the marker is left after a completed createdb (err=%v)", err)
+	}
+	if err := os.Remove(f.calls); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := f.run(); code != 0 {
+		t.Fatalf("second start: exit %d:\n%s", code, out)
+	}
+	wantCalls(t, f.recorded(), "cubrid server start "+dbName, callManagerStart)
+}
+
+// A database directory that holds files although the database is not
+// registered, and carries no marker (an interrupted createdb of an earlier
+// image, or someone's data), is not created over: createdb would refuse it
+// and exit 1. An empty directory is created into.
+func TestEntrypoint_UnregisteredDirectoryWithFilesIsNotCreatedOver(t *testing.T) {
+	for _, withFiles := range []bool{true, false} {
+		t.Run(fmt.Sprintf("files=%t", withFiles), func(t *testing.T) {
+			f := newFixture(t, managerStub)
+			dir := filepath.Join(f.databases, dbName)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			volume := filepath.Join(dir, dbName+"_lgat")
+			if withFiles {
+				if err := os.WriteFile(volume, []byte("data"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			code, out := f.run()
+			if code != 0 {
+				t.Fatalf("exit %d:\n%s", code, out)
+			}
+			if !withFiles {
+				wantCalls(t, f.recorded(), "cubrid createdb", "cubrid server start "+dbName, callManagerStart)
+				return
+			}
+			wantCalls(t, f.recorded(), callManagerStart)
+			if data, err := os.ReadFile(volume); err != nil || string(data) != "data" {
+				t.Errorf("the files in the directory were changed (err=%v): %q", err, data)
+			}
+			if !strings.Contains(out, "is not registered") || !strings.Contains(out, dir) {
+				t.Errorf("the log does not say why nothing was created:\n%s", out)
+			}
+		})
+	}
+}
+
+// A termination that arrives while the entrypoint's own createdb runs is
+// handled when createdb returns: nothing is started after it, neither the
+// server nor the manager.
+func TestEntrypoint_TerminationDuringCreatedb(t *testing.T) {
+	f := newFixture(t, blockingManagerStub)
+	f.env["CUBRID_CREATEDB_SECONDS"] = "1"
+	cmd := f.command()
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return len(f.recorded()) > 0 && strings.HasPrefix(f.recorded()[0], "cubrid createdb") }, &out)
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitExit(cmd); err != nil {
+		t.Fatalf("entrypoint after SIGTERM during createdb: %v\n%s", err, out.String())
+	}
+	wantCalls(t, f.recorded(), "cubrid createdb", callShutdown)
 }
 
 // A configured HA member without a database waits: the first database is

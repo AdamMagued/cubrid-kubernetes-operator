@@ -1393,6 +1393,81 @@ failed in `createdb` inside the Pod.
 (`<name>_<host>`); other engine versions; names with digits, underscores or
 upper-case letters at the boundary. One run on one image.
 
+## POC-25 — what an interrupted standalone `createdb` leaves behind (ADR-0003/0010, #312) — **observation: a second `createdb` fails, an early registered start fails**
+
+**Environment:** `docker.io/cubrid/cubrid:11.4`
+(`sha256:1248b77ad39888df9e064655937188ab99fe056ed7e35b57d06155a015dc1791`,
+CUBRID 11.4.6), Docker 29.2.1 on a native linux/amd64 host, 2026-10-15. One
+container running as `cubrid` (UID 1000); a standalone database, no HA.
+
+**Procedure:** in an empty `<CUBRID_DATABASES>/appdb`, the command the
+entrypoint runs:
+`cubrid createdb --db-volume-size=512M --server-name=<host> appdb en_US`,
+started in a process group of its own and ended with `SIGKILL` to the whole
+group (what the loss of the container does), either after a fixed delay
+(0.05 s, 0.1 s, 0.3 s, 1 s, 3 s, 10 s, 15 s, 25 s, 33 s, 35 s) or a fixed time
+(0, 1, 2 or 3 s) after `databases.txt` first named the database. What was left
+was listed, and then either `createdb` was run again with the same arguments
+in the same directory, or `cubrid server start appdb` followed by a `csql`
+query. One complete `createdb` was sampled every 50 ms, and one ran with an
+`.im-operation` file already in the directory.
+
+**Observed — the timeline of one complete `createdb` (37.7 s, exit 0):**
+
+| From about | In the directory | In `databases.txt` |
+|---|---|---|
+| 0.05 s | `lob/` | nothing |
+| 0.2 s | `appdb_lgat`, `appdb_lgat__lock` | nothing |
+| 3.7 s | `appdb_lginf`, `appdb_vinf`, then `appdb`, `appdb_dwb`, `appdb_lgar_t` | nothing |
+| 32.0 s | `appdb_keys` | nothing |
+| 32.3 s | the same | `appdb` registered |
+| 34.7 s | `appdb_dwb` and `appdb_lgat__lock` removed | registered |
+| 37.7 s | exit 0 | registered |
+
+The timings vary from run to run (registration after 27 to 41 s), the order
+did not.
+
+**Observed — after the interruption:**
+
+| Killed | Left behind | `createdb` again | `cubrid server start` |
+|---|---|---|---|
+| 0.05 s, 0.1 s (2 runs) | an empty `lob/`, not registered | exit 0: the database is created | not run |
+| 0.3 s to 25 s (7 runs) | volumes (`appdb_lgat`, later also `appdb`, `appdb_vinf`, …), not registered | exit 1, `Volume "…/appdb_lgat" already exists.` (or `appdb_vinf`); the files are left as they were | not run |
+| 33 s, 35 s (2 runs) | the same, not registered | not run | exit 1, `Database "appdb" is unknown` |
+| 0 to 2 s after the registration, `appdb_dwb` and `appdb_lgat__lock` still there (5 runs) | every volume, registered | exit 1, `Database "appdb" already exists.` (2 runs) | exit 1, `LOG FATAL ERROR: log_recovery:locator_initialize` (3 runs) |
+| 2 and 3 s after the registration, `appdb_dwb` and the lock already removed (2 runs) | every volume, registered | not run | exit 0; `select count(*) from db_class` answers 49 |
+
+A `createdb` with `.im-operation` in its directory exited 0 and left the file
+as it was; the database started and answered the query.
+
+**With the change of #312**, the image built from this repository
+(`build/instance-manager/Dockerfile` on the same base) was run as a
+standalone member twice on a fresh volume. Killed (`docker kill -s KILL`)
+10 s into `createdb`: the volumes and `.im-operation` (`entrypoint-createdb`)
+were left, not registered; started again, the entrypoint ran no `createdb` and
+no server, logged that the database is unfinished and how to create it
+again, and ran only the Instance Manager (no restart in 15 s). Stopped
+(`docker stop`, `SIGTERM`) 10 s into `createdb`: `createdb` ran to its end,
+the entrypoint started nothing more and exited 0 after 12 s; the marker was
+gone and the database registered; started again, the server started.
+
+**Consequence:** before #312, either outcome of an interrupted standalone
+`createdb` ended the entrypoint with a failing command, so the container
+crash-looped: a second `createdb` into the directory (exit 1), or a start of
+the registered, unfinished database (exit 1). `createdb` never wrote over
+what was there. Whether a registered database is complete cannot be told
+from the outside: the last seconds of `createdb` after the registration may
+or may not be needed for a start to succeed. The entrypoint therefore writes
+the ownership marker around its own `createdb` and treats any database that
+still carries it as unfinished.
+
+**Not covered:** an interruption by a full volume or by the node's loss
+(only a `SIGKILL` to the process group in a running container); data volumes
+other than 512M; other engine versions; Kind or a real cluster. A database
+started at 2 or 3 s after the registration answered one query; it was not
+checked further. One image, local Docker; a few runs per stage, not a general
+CUBRID guarantee.
+
 ## Net assessment
 
 The fundamentals **and the core HA lifecycle** are now empirically confirmed
