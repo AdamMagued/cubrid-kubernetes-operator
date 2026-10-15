@@ -90,16 +90,19 @@ entrypoint_marker="entrypoint-createdb"
 # marker is in place for as long as createdb runs and is removed only when it
 # succeeded: an interrupted createdb leaves volumes behind, registered or not,
 # which createdb refuses to create over and the server fails to start
-# (docs/poc/RESULTS.md, POC-25). Returns 1, with the marker left, when
-# createdb failed.
+# (docs/poc/RESULTS.md, POC-25). The marker is synced before createdb starts,
+# so that it is on the volume before any volume createdb writes. Returns 2
+# when createdb could not be prepared and was not run, and 1, with the marker
+# left, when createdb failed.
 init_db() {
   if database_registered; then
     log "database '${CUBRID_DB}' already present"
     return 0
   fi
-  touch "${CUBRID_DATABASES}/databases.txt" || return 1
-  mkdir -p "${db_dir}" || return 1
-  ( umask 077 && echo "${entrypoint_marker}" > "${marker}" ) || return 1
+  touch "${CUBRID_DATABASES}/databases.txt" || return 2
+  mkdir -p "${db_dir}" || return 2
+  ( umask 077 && echo "${entrypoint_marker}" > "${marker}" ) || return 2
+  sync "${marker}" "${db_dir}" || return 2
   log "createdb '${CUBRID_DB}' (registers databases.txt with absolute paths)"
   ( cd "${db_dir}" \
     && cubrid createdb --db-volume-size="${CUBRID_VOLUME_SIZE:-512M}" \
@@ -108,9 +111,9 @@ init_db() {
 }
 
 # The way out of a refused standalone database, for the person who reads the
-# log: the data is never removed here.
+# log: the data is never removed here. $1 says why it is unfinished.
 log_unfinished_createdb() {
-  log "database '${CUBRID_DB}' is unfinished (${marker}): the entrypoint's createdb did not complete; it is neither created over nor started. To create it again, stop this member, remove ${db_dir} and the '${CUBRID_DB}' line of ${CUBRID_DATABASES}/databases.txt, and start it again"
+  log "database '${CUBRID_DB}' is unfinished (${marker}): $1; it is neither created over nor started. No CUBRID process uses it. To create it again, remove ${db_dir} and the '${CUBRID_DB}' line of ${CUBRID_DATABASES}/databases.txt, then restart this member"
 }
 
 # Put the operator's HA configuration where CUBRID reads it. The ConfigMap
@@ -128,9 +131,16 @@ install_ha_conf() {
 start_cubrid() {
   case "${CUBRID_COMPONENTS}" in
     SERVER)
-      if [ "${CUBRID_BOOTSTRAP}" = "new" ] && ! init_db; then
-        log_unfinished_createdb
-        return 0
+      if [ "${CUBRID_BOOTSTRAP}" = "new" ]; then
+        local rc=0
+        init_db || rc=$?
+        if [ "${rc}" = "2" ]; then
+          log "could not prepare createdb of '${CUBRID_DB}' in ${db_dir} (databases.txt, the directory or its marker could not be written): createdb was not run and nothing is started"
+          return 0
+        elif [ "${rc}" != "0" ]; then
+          log_unfinished_createdb "the entrypoint's createdb did not complete"
+          return 0
+        fi
       fi
       # A termination that arrived during createdb was handled when it
       # returned, before anything was running: nothing more is started.
@@ -138,11 +148,13 @@ start_cubrid() {
         log "termination requested during createdb: the server is not started"
         return 0
       fi
+      started=1
       cubrid server start "${CUBRID_DB}" ;;
     MASTER|SLAVE|HA)
       # An HA member never creates its database here: the first one is created
       # once, on one member, through the Instance Manager, and the others are
       # seeded from it (ADR-0010). This only restarts an initialized member.
+      started=1
       cubrid heartbeat start ;;
   esac
 }
@@ -162,8 +174,14 @@ if [ -e "${marker}" ] || [ -L "${marker}" ]; then
   if [ "${CUBRID_COMPONENTS}" != "SERVER" ] && [ -f "${CUBRID_HA_CONF}" ]; then
     install_ha_conf
   fi
-  if [ ! -L "${marker}" ] && [ "$(cat "${marker}" 2>/dev/null)" = "${entrypoint_marker}" ]; then
-    log_unfinished_createdb
+  marker_value=""
+  [ -L "${marker}" ] || marker_value="$(cat "${marker}" 2>/dev/null || true)"
+  if [ "${marker_value}" = "${entrypoint_marker}" ]; then
+    log_unfinished_createdb "the entrypoint's createdb did not complete"
+  elif [ "${CUBRID_COMPONENTS}" = "SERVER" ] && ! [[ "${marker_value}" =~ ^op-[0-9a-f]{32}$ ]]; then
+    # The manager resolves only a marker that names one of its operations;
+    # on a standalone member nothing else ever will.
+    log_unfinished_createdb "the marker names no operation of the Instance Manager"
   else
     log "database '${CUBRID_DB}' is unfinished (${marker}): it is not started; waiting for the Instance Manager"
   fi
@@ -172,7 +190,7 @@ elif [ "${CUBRID_COMPONENTS}" = "SERVER" ] && [ "${CUBRID_BOOTSTRAP}" = "new" ] 
   # Files without a registration and without a marker: a createdb of an
   # earlier image that was interrupted, or someone's data. createdb refuses
   # to create over volumes that are there (POC-25) and nothing is removed.
-  log "database directory ${db_dir} holds files, but '${CUBRID_DB}' is not registered in ${CUBRID_DATABASES}/databases.txt: createdb is not run over it and nothing is started. To create the database, stop this member, move the files out of ${db_dir}, and start it again"
+  log "database directory ${db_dir} holds files, but '${CUBRID_DB}' is not registered in ${CUBRID_DATABASES}/databases.txt: createdb is not run over it and nothing is started. To create the database, move the files out of ${db_dir}, then restart this member"
 elif [ "${CUBRID_BOOTSTRAP}" = "recovery" ] && ! database_registered; then
   # Nothing to start yet: the restore creates and registers the database. An
   # HA member's restore starts heartbeat, which needs the configuration.
@@ -192,10 +210,14 @@ elif [ "${CUBRID_COMPONENTS}" != "SERVER" ] && ! database_registered; then
 else
   [ "${CUBRID_COMPONENTS}" = "SERVER" ] || install_ha_conf
   start_cubrid
-  started=1
 fi
 
 if [ "${terminating}" = "1" ]; then
+  # A termination handled after the last check but before the start found
+  # nothing to stop: stop what was started since.
+  if [ "${started}" = "1" ]; then
+    "${IM_BIN}" shutdown || true
+  fi
   log "terminated before the Instance Manager was started"
   exit 0
 fi

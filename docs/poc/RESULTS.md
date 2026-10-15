@@ -1442,14 +1442,29 @@ as it was; the database started and answered the query.
 
 **With the change of #312**, the image built from this repository
 (`build/instance-manager/Dockerfile` on the same base) was run as a
-standalone member twice on a fresh volume. Killed (`docker kill -s KILL`)
-10 s into `createdb`: the volumes and `.im-operation` (`entrypoint-createdb`)
-were left, not registered; started again, the entrypoint ran no `createdb` and
-no server, logged that the database is unfinished and how to create it
-again, and ran only the Instance Manager (no restart in 15 s). Stopped
-(`docker stop`, `SIGTERM`) 10 s into `createdb`: `createdb` ran to its end,
-the entrypoint started nothing more and exited 0 after 12 s; the marker was
-gone and the database registered; started again, the server started.
+standalone member, each time on a fresh Docker named volume at
+`/var/lib/cubrid`, with the entrypoint as PID 1 as in a Pod unless noted.
+On that volume `createdb` is faster than in the runs above (which wrote to
+the container's own file system): 14 to 15 s.
+
+- Killed (`docker kill -s KILL`) 10 s into `createdb`: the volumes and
+  `.im-operation` (`entrypoint-createdb`) were left, not registered. Started
+  again, the entrypoint ran no `createdb` and no server, logged that the
+  database is unfinished and how to create it again, and ran only the
+  Instance Manager. It was still running, with no restart, 15 s later in a
+  first run and 45 s later in a second one, past the 30 s the manager's
+  process watchdog allows a missing process: the watchdog arms only after it
+  has seen the CUBRID processes run, which they never did here.
+- Stopped with `docker stop -t 120` (`SIGTERM`, `SIGKILL` only after 120 s)
+  10 s into `createdb`, twice: once with the entrypoint as PID 1, once under
+  `docker run --init`. `createdb` was not interrupted: it returned 14.4 s
+  and 15.4 s after it started, that is 4.3 s and 5.4 s after the `SIGTERM`.
+  The entrypoint then logged `termination requested during createdb: the
+  server is not started`, started nothing more and exited 0, 5.5 s and 6.5 s
+  after the `SIGTERM`. The marker was gone and the database registered;
+  started again, the server started (`cub_server appdb` running). An earlier
+  run of the same case (also `-t 120`) ended 12 s after the `SIGTERM`; its
+  `createdb` duration was not recorded.
 
 **Consequence:** before #312, either outcome of an interrupted standalone
 `createdb` ended the entrypoint with a failing command, so the container

@@ -99,9 +99,9 @@ recorded on the engine (#345). Ordinal 0 is
 only where the database is created; which member is master afterwards is
 CUBRID's decision. A standalone member's entrypoint runs `createdb` itself,
 inside the ownership marker described below with a value that is not an
-operation ID, and never creates over or starts a database that this marker,
-or files in its directory without a registration, show to be unfinished
-(ADR-0003, #312).
+operation ID. It never creates over or starts a database that this marker
+shows to be unfinished, and never creates over files in a database
+directory without a registration (ADR-0003, #312).
 An HA member's entrypoint never runs `createdb`: without a database it
 starts nothing and waits, and with one it starts heartbeat. A
 database directory that exists without a registration stops the bootstrap; it

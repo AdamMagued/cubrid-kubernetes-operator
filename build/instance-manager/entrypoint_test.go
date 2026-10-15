@@ -620,6 +620,171 @@ func TestEntrypoint_TerminationDuringCreatedb(t *testing.T) {
 		t.Fatalf("entrypoint after SIGTERM during createdb: %v\n%s", err, out.String())
 	}
 	wantCalls(t, f.recorded(), "cubrid createdb", callShutdown)
+	// createdb ran to its end: the database is complete and registered, and
+	// the next start starts it.
+	if _, err := os.Lstat(filepath.Join(f.databases, dbName, ".im-operation")); !os.IsNotExist(err) {
+		t.Errorf("the marker is left after a completed createdb (err=%v)", err)
+	}
+	data, err := os.ReadFile(filepath.Join(f.databases, "databases.txt"))
+	if err != nil || !strings.HasPrefix(string(data), dbName+"\t") {
+		t.Errorf("the database is not registered (err=%v): %q", err, data)
+	}
+}
+
+// A termination during a createdb that then fails starts nothing either, and
+// the marker stays.
+func TestEntrypoint_TerminationDuringAFailingCreatedb(t *testing.T) {
+	f := newFixture(t, blockingManagerStub)
+	f.env["CUBRID_CREATEDB_SECONDS"] = "1"
+	f.env["CUBRID_CREATEDB_EXIT"] = "1"
+	cmd := f.command()
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return len(f.recorded()) > 0 && strings.HasPrefix(f.recorded()[0], "cubrid createdb") }, &out)
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitExit(cmd); err != nil {
+		t.Fatalf("entrypoint after SIGTERM during a failing createdb: %v\n%s", err, out.String())
+	}
+	wantCalls(t, f.recorded(), "cubrid createdb", callShutdown)
+	marker := filepath.Join(f.databases, dbName, ".im-operation")
+	if data, err := os.ReadFile(marker); err != nil || string(data) != entrypointMarker {
+		t.Errorf("the marker was not kept (err=%v): %q", err, data)
+	}
+}
+
+// When the marker cannot be written, createdb is not run: it would run
+// unprotected. The log says that the preparation failed, not that createdb
+// was interrupted, and only the manager runs.
+func TestEntrypoint_UnwritableMarkerRunsNoCreatedb(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root can write anywhere")
+	}
+	f := newFixture(t, managerStub)
+	dir := filepath.Join(f.databases, dbName)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	code, out := f.run()
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	wantCalls(t, f.recorded(), callManagerStart)
+	if !strings.Contains(out, "could not prepare createdb") {
+		t.Errorf("the log does not say that createdb could not be prepared:\n%s", out)
+	}
+	if strings.Contains(out, "createdb did not complete") {
+		t.Errorf("the log calls a createdb that never ran interrupted:\n%s", out)
+	}
+}
+
+// On a standalone member, a marker that names no operation of the Instance
+// Manager (empty, unreadable, a dangling link) is never resolved by the
+// manager: the log gives the way out, not "waiting for the Instance
+// Manager". A marker with an operation ID still waits for the manager.
+func TestEntrypoint_StandaloneMarkerWithoutAnOperationID(t *testing.T) {
+	const opID = "op-0123456789abcdef0123456789abcdef"
+	markers := map[string]string{"empty": "", "garbage": "x\n", "dangling link": "", "operation": opID + "\n"}
+	for name, value := range markers {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, managerStub)
+			f.registerDatabase()
+			dir := filepath.Join(f.databases, dbName)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(dir, ".im-operation")
+			var err error
+			if name == "dangling link" {
+				err = os.Symlink(filepath.Join(f.root, "missing"), marker)
+			} else {
+				err = os.WriteFile(marker, []byte(value), 0o600)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			code, out := f.run()
+			if code != 0 {
+				t.Fatalf("exit %d:\n%s", code, out)
+			}
+			wantCalls(t, f.recorded(), callManagerStart)
+			waits := strings.Contains(out, "waiting for the Instance Manager")
+			guides := strings.Contains(out, "remove "+dir)
+			if name == "operation" {
+				if !waits || guides {
+					t.Errorf("a marker with an operation ID must wait for the manager:\n%s", out)
+				}
+				return
+			}
+			if waits || !guides {
+				t.Errorf("a marker without an operation ID must give the way out:\n%s", out)
+			}
+		})
+	}
+}
+
+// A termination handled after the last check before the server start, but
+// before the start itself, is followed by the start: the script must stop
+// that server before it exits instead of leaving it to be killed with the
+// container. The window is a few builtins wide, so the test holds it open as
+// TestEntrypoint_TerminationAroundTheStartOfTheManager does.
+func TestEntrypoint_TerminationJustBeforeTheServerStart(t *testing.T) {
+	const startLine = "      cubrid server start \"${CUBRID_DB}\" ;;\n"
+	f := newFixture(t, blockingManagerStub)
+	f.registerDatabase()
+	release := filepath.Join(f.root, "release")
+	script, err := os.ReadFile("entrypoint.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(script), startLine) != 1 {
+		t.Fatalf("entrypoint.sh has no single line %q to hold the window at", startLine)
+	}
+	window := `      echo window >> "${CALLS}"; while [ ! -e "` + release + `" ]; do :; done` + "\n"
+	path := filepath.Join(f.root, "entrypoint-held.sh")
+	held := strings.Replace(string(script), startLine, window+startLine, 1)
+	if err := os.WriteFile(path, []byte(held), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := scriptCommand(t, path, f.tools, f.env)
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return index(f.recorded(), "window") >= 0 }, &out)
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return index(f.recorded(), callShutdown) >= 0 }, &out)
+	if err := os.WriteFile(release, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitExit(cmd); err != nil {
+		t.Fatalf("entrypoint after a termination just before the server start: %v\n%s", err, out.String())
+	}
+	calls := f.recorded()
+	start := index(calls, "cubrid server start "+dbName)
+	last := -1
+	for i, call := range calls {
+		if call == callShutdown {
+			last = i
+		}
+	}
+	if start < 0 || last < start {
+		t.Errorf("the server started after the termination was not stopped: %q", calls)
+	}
+	if managerStarted(calls) {
+		t.Errorf("the manager was started after the termination: %q", calls)
+	}
 }
 
 // A configured HA member without a database waits: the first database is
