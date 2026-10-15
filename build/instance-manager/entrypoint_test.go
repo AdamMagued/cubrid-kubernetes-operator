@@ -731,6 +731,88 @@ func TestEntrypoint_StandaloneMarkerWithoutAnOperationID(t *testing.T) {
 	}
 }
 
+// A marker that names no operation of the Instance Manager on an HA member
+// still waits for the manager: the HA bootstrap refuses it and reports it.
+func TestEntrypoint_HAMarkerWithoutAnOperationIDWaitsForTheManager(t *testing.T) {
+	for name, value := range map[string]string{"empty": "", "garbage": "x\n"} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, managerStub)
+			f.env["CUBRID_COMPONENTS"] = componentsHA
+			f.configureHA()
+			f.registerDatabase()
+			dir := filepath.Join(f.databases, dbName)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, ".im-operation"), []byte(value), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			code, out := f.run()
+			if code != 0 {
+				t.Fatalf("exit %d:\n%s", code, out)
+			}
+			wantCalls(t, f.recorded(), callManagerStart)
+			if !strings.Contains(out, "waiting for the Instance Manager") || strings.Contains(out, "remove "+dir) {
+				t.Errorf("an HA member must wait for the manager:\n%s", out)
+			}
+		})
+	}
+}
+
+// In a recovery bootstrap a restart waits for a restore, so the way out of an
+// unfinished standalone database is to run the restore again.
+func TestEntrypoint_UnfinishedStandaloneDatabaseInRecovery(t *testing.T) {
+	f := newFixture(t, managerStub)
+	f.env["CUBRID_BOOTSTRAP"] = bootstrapRecovery
+	dir := filepath.Join(f.databases, dbName)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".im-operation"), []byte(entrypointMarker), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, out := f.run()
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	wantCalls(t, f.recorded(), callManagerStart)
+	if !strings.Contains(out, "remove "+dir) || !strings.Contains(out, "run the restore again") ||
+		strings.Contains(out, "restart this member") {
+		t.Errorf("the log does not give the recovery way out:\n%s", out)
+	}
+}
+
+// A marker this start wrote but could not make durable is removed again:
+// createdb never ran, so the next start must not call it interrupted. Only
+// that marker goes.
+func TestEntrypoint_UnsyncedMarkerIsRemovedAndNoCreatedbRuns(t *testing.T) {
+	f := newFixture(t, managerStub)
+	f.tools = writeTools(t, f.root, map[string]string{"sync": "#!/bin/bash\nexit 1\n"})
+	code, out := f.run()
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	wantCalls(t, f.recorded(), callManagerStart)
+	if !strings.Contains(out, "could not prepare createdb") {
+		t.Errorf("the log does not say that createdb could not be prepared:\n%s", out)
+	}
+	dir := filepath.Join(f.databases, dbName)
+	if _, err := os.Lstat(filepath.Join(dir, ".im-operation")); !os.IsNotExist(err) {
+		t.Errorf("the marker this start wrote was left (err=%v)", err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("the database directory was removed: %v", err)
+	}
+	if err := os.Remove(f.calls); err != nil {
+		t.Fatal(err)
+	}
+	f.tools = writeTools(t, f.root, map[string]string{"sync": "#!/bin/bash\nexit 0\n"})
+	if code, out := f.run(); code != 0 {
+		t.Fatalf("second start: exit %d:\n%s", code, out)
+	}
+	wantCalls(t, f.recorded(), "cubrid createdb", "cubrid server start "+dbName, callManagerStart)
+}
+
 // A termination handled after the last check before the server start, but
 // before the start itself, is followed by the start: the script must stop
 // that server before it exits instead of leaving it to be killed with the

@@ -101,8 +101,17 @@ init_db() {
   fi
   touch "${CUBRID_DATABASES}/databases.txt" || return 2
   mkdir -p "${db_dir}" || return 2
-  ( umask 077 && echo "${entrypoint_marker}" > "${marker}" ) || return 2
-  sync "${marker}" "${db_dir}" || return 2
+  # The marker is absent here (a present one is refused before this runs). A
+  # marker this run wrote but could not make durable is removed again, since
+  # createdb never ran; nothing else is.
+  if [ -e "${marker}" ] || [ -L "${marker}" ]; then
+    return 2
+  fi
+  if ! ( umask 077 && echo "${entrypoint_marker}" > "${marker}" ) \
+      || ! sync "${marker}" "${db_dir}"; then
+    rm -f "${marker}"
+    return 2
+  fi
   log "createdb '${CUBRID_DB}' (registers databases.txt with absolute paths)"
   ( cd "${db_dir}" \
     && cubrid createdb --db-volume-size="${CUBRID_VOLUME_SIZE:-512M}" \
@@ -111,9 +120,13 @@ init_db() {
 }
 
 # The way out of a refused standalone database, for the person who reads the
-# log: the data is never removed here. $1 says why it is unfinished.
+# log: the data is never removed here. $1 says why it is unfinished. In a
+# recovery bootstrap a restart waits for a restore, which refuses the
+# directory until it is gone.
 log_unfinished_createdb() {
-  log "database '${CUBRID_DB}' is unfinished (${marker}): $1; it is neither created over nor started. No CUBRID process uses it. To create it again, remove ${db_dir} and the '${CUBRID_DB}' line of ${CUBRID_DATABASES}/databases.txt, then restart this member"
+  local next="restart this member"
+  [ "${CUBRID_BOOTSTRAP}" = "recovery" ] && next="run the restore again"
+  log "database '${CUBRID_DB}' is unfinished (${marker}): $1; it is neither created over nor started. No CUBRID process uses it. To go on, remove ${db_dir} and the '${CUBRID_DB}' line of ${CUBRID_DATABASES}/databases.txt, then ${next}"
 }
 
 # Put the operator's HA configuration where CUBRID reads it. The ConfigMap
@@ -178,7 +191,7 @@ if [ -e "${marker}" ] || [ -L "${marker}" ]; then
   [ -L "${marker}" ] || marker_value="$(cat "${marker}" 2>/dev/null || true)"
   if [ "${marker_value}" = "${entrypoint_marker}" ]; then
     log_unfinished_createdb "the entrypoint's createdb did not complete"
-  elif [ "${CUBRID_COMPONENTS}" = "SERVER" ] && ! [[ "${marker_value}" =~ ^op-[0-9a-f]{32}$ ]]; then
+  elif [ "${CUBRID_COMPONENTS}" = "SERVER" ] && ! [[ "${marker_value}" =~ ^op-[0123456789abcdef]{32}$ ]]; then
     # The manager resolves only a marker that names one of its operations;
     # on a standalone member nothing else ever will.
     log_unfinished_createdb "the marker names no operation of the Instance Manager"

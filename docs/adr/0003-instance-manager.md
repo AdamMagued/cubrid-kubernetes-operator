@@ -396,7 +396,7 @@ cases creating and starting nothing and running only the manager:
   unreadable, a dangling link): the manager resolves only its own. The log
   says the database is unfinished and how to create it again: remove `<db>`
   and its `databases.txt` line (no CUBRID process uses them), then restart
-  the member.
+  the member, or, in a recovery bootstrap, run the restore again.
   With the entrypoint's value the server was never started on that data, so
   no client wrote to it; a marker of unknown origin is worth a look before
   anything is removed. The manager never removes such a directory: the value
@@ -407,8 +407,9 @@ cases creating and starting nothing and running only the manager:
   while the database is not registered; the way out is to move the files
   out of `<db>` and restart the member.
 
-When the marker or the directory cannot be written, `createdb` is not run
-and the log says it could not be prepared. A termination that arrives
+When the marker or the directory cannot be written, or the marker cannot be
+synced, `createdb` is not run, the log says it could not be prepared, and a
+marker that start wrote is removed again. A termination that arrives
 during that `createdb` is handled when it returns, and nothing more is
 started; one handled just before the server start, which then still runs,
 stops that server before the script exits.
