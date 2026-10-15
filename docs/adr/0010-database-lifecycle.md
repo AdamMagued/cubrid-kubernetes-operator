@@ -97,8 +97,13 @@ within the operator's attempt limit (#274). That a status without HA node
 information means inactive heartbeat is an assumption: that output is not
 recorded on the engine (#345). Ordinal 0 is
 only where the database is created; which member is master afterwards is
-CUBRID's decision. An HA member's entrypoint never runs `createdb`: without a
-database it starts nothing and waits, and with one it starts heartbeat. A
+CUBRID's decision. A standalone member's entrypoint runs `createdb` itself,
+inside the ownership marker described below with a value that is not an
+operation ID. It never creates over or starts a database that this marker
+shows to be unfinished, and never creates over files in a database
+directory without a registration (ADR-0003, #312).
+An HA member's entrypoint never runs `createdb`: without a database it
+starts nothing and waits, and with one it starts heartbeat. A
 database directory that exists without a registration stops the bootstrap; it
 is never removed automatically. `status.databases[]` records `Creating`,
 `Created` with `primaryCreated`, or `Failed`. The first member
@@ -231,7 +236,9 @@ file when `createdb` has succeeded, or when the restore has been recorded
 recorded as `Failed`, and never for a restore that had recorded its data as
 restored (ADR-0008, #267). A directory without the file, with
 an unreadable one, or with one that names an unknown or running operation is
-left untouched and stops the bootstrap.
+left untouched and stops the bootstrap. The marker a standalone entrypoint
+writes around its own `createdb` (`entrypoint-createdb`) is such an
+unreadable one: the manager never removes that directory.
 
 **`ha_db_list` generation.** Join `spec.databases[*].name` in spec order
 with commas; write identically to every node's `cubrid_ha.conf`. Names

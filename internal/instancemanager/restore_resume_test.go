@@ -469,3 +469,55 @@ func TestResumeCompletedRestores_NeedsTheHAConfigurationOfAnHAMember(t *testing.
 		})
 	}
 }
+
+// The marker the image's entrypoint writes around a standalone member's own
+// createdb names no operation of this manager. A restore into that target,
+// the adoption of earlier restored data and the start of completed restores
+// all leave the directory and the marker as they are, and run no command.
+func TestRestore_LeavesTheEntrypointsUnfinishedCreatedbAlone(t *testing.T) {
+	const entrypointMarker = "entrypoint-createdb"
+	f := newResumeFixture(t)
+	dir := filepath.Join(f.databases, dbName)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	volume := filepath.Join(dir, dbName+"_lgat")
+	const left = "left by createdb"
+	for name, content := range map[string]string{ownershipMarker: entrypointMarker + "\n", filepath.Base(volume): left} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantUntouched := func() {
+		t.Helper()
+		if got := f.marker(); got != entrypointMarker {
+			t.Errorf("marker = %q, want it kept as %q", got, entrypointMarker)
+		}
+		if data, err := os.ReadFile(volume); err != nil || string(data) != left {
+			t.Errorf("the files createdb left were changed (err=%v): %q", err, data)
+		}
+	}
+
+	cli := &volumeCLI{databases: f.databases}
+	f.start(cli)
+	if err := f.server.ResumeCompletedRestores(t.Context()); err != nil {
+		t.Fatalf("ResumeCompletedRestores: %v", err)
+	}
+	if calls := cli.recorded(); len(calls) != 0 {
+		t.Errorf("commands ran at the start of the manager: %q", calls)
+	}
+	wantUntouched()
+
+	op := f.run("restore-1")
+	if op.State != OpFailed || !strings.Contains(op.FailureReason, "unreadable ownership marker") {
+		t.Fatalf("restore = %s (%s), want Failed for an unreadable ownership marker", op.State, op.FailureReason)
+	}
+	if calls := cli.recorded(); len(calls) != 0 {
+		t.Errorf("commands ran for a restore over the entrypoint's createdb: %q", calls)
+	}
+	restored, err := f.server.adoptRestored(op.ID, dbName)
+	if err != nil || restored != nil {
+		t.Errorf("adoptRestored = %v, %v; want nothing taken over", restored, err)
+	}
+	wantUntouched()
+}

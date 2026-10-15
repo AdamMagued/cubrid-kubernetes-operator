@@ -327,6 +327,23 @@ the same; the member's role is what `/v1/role` answers to a caller with the
 token. A credential is never logged: no token, no `Authorization` header, no
 object-storage key, also not inside a failed command's output.
 
+### Runbook: a standalone member that starts only the Instance Manager
+
+The database entrypoint of a standalone member (`CUBRID_COMPONENTS=SERVER`)
+refuses to create over or start a database it cannot show to be whole, and
+runs only the Instance Manager instead of crash-looping (ADR-0003, #312). The
+member is then not ready. Read the reason in `kubectl logs <pod>`:
+
+| Log line (`[im-entrypoint]`) | What it means | What to do |
+|---|---|---|
+| `database '<db>' is unfinished (<dir>/.im-operation): the entrypoint's createdb did not complete; …` | The entrypoint's own `createdb` was interrupted or failed. Its volumes may be left, registered in `databases.txt` or not. The server never ran on them | No CUBRID process runs in the Pod, so the files can be changed from inside it (`kubectl exec`): remove `<dir>` and the `<db>` line of `databases.txt`, then delete the Pod. Its next start creates the database; in a recovery bootstrap (the log then says to run the restore again) it waits for the restore instead |
+| `database '<db>' is unfinished (<dir>/.im-operation): the marker names no operation of the Instance Manager; …` | The marker is empty, unreadable or a dangling link, so neither the entrypoint nor the manager owns it | Find out where it came from before anything is removed; then as above |
+| `database directory <dir> holds files, but '<db>' is not registered in …/databases.txt: …` | Files without a registration and without a marker: an interrupted `createdb` of an earlier build, or someone's data | Move the files out of `<dir>` from inside the Pod (keep them if they may be data), then delete the Pod |
+| `could not prepare createdb of '<db>' in <dir> (…)` | `databases.txt`, the directory or the marker could not be written, or the marker could not be synced; `createdb` was not run, and a marker this start wrote was removed again | Fix the volume (permissions, space) and restart the member |
+
+The entrypoint never removes these files itself, and neither does the
+Instance Manager.
+
 ## Metrics
 
 Metrics describe what was observed. They do not decide by themselves whether
