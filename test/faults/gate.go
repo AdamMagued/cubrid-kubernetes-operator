@@ -61,6 +61,10 @@ type Gate struct {
 	// Describe, if set, returns the verified state for the entry, such as
 	// the identity of each member.
 	Describe func(ctx context.Context) string
+	// Redact, if set, removes credentials from a failing condition and a
+	// reason before they are cut to their bound. The evidence files are
+	// redacted again when they are written.
+	Redact func(string) string
 
 	blocked string
 	spent   time.Duration
@@ -119,14 +123,23 @@ func (u *Unmet) Error() string {
 }
 
 // unmetOf returns the failing condition err names, or err itself as one of
-// kind UnmetOther, with its detail bounded.
-func unmetOf(err error) *Unmet {
+// kind UnmetOther, with its detail redacted and bounded.
+func (g *Gate) unmetOf(err error) *Unmet {
 	u := &Unmet{Kind: UnmetOther, Detail: err.Error()}
 	if found := (*Unmet)(nil); errors.As(err, &found) {
 		*u = *found
 	}
-	u.Detail = clip(u.Detail, MaxUnmetDetail)
+	u.Detail = g.cut(u.Detail, MaxUnmetDetail)
 	return u
+}
+
+// cut redacts s, then clips it to n bytes. Redacting first keeps a cut from
+// leaving part of a secret that the redaction would no longer recognize.
+func (g *Gate) cut(s string, n int) string {
+	if g.Redact != nil {
+		s = g.Redact(s)
+	}
+	return clip(s, n)
 }
 
 // clip cuts s to at most n bytes, at a character boundary, and says so.
@@ -194,7 +207,7 @@ func (g *Gate) Enter(ctx context.Context, variant string, needs func(ctx context
 	if !held {
 		g.Block(fmt.Sprintf("%s before %s within %s%s: %s",
 			ReasonStartingStateNotRestored, variant, limit.Round(time.Millisecond), budgetNote,
-			clip(fmt.Sprint(err), 2*MaxUnmetDetail)))
+			g.cut(fmt.Sprint(err), 2*MaxUnmetDetail)))
 		e.Reason = g.blocked
 		return e
 	}
@@ -209,7 +222,7 @@ func (g *Gate) Enter(ctx context.Context, variant string, needs func(ctx context
 				ReasonStepStillRunning, variant))
 			e.Reason = g.blocked
 		case err != nil:
-			e.Reason = ReasonOrderDependency + ": " + err.Error()
+			e.Reason = ReasonOrderDependency + ": " + g.cut(err.Error(), 2*MaxUnmetDetail)
 		}
 	}
 	return e
@@ -249,7 +262,7 @@ func (g *Gate) attempt(ctx context.Context) (bool, error) {
 // the condition kept before, so that only the last one is kept.
 func (g *Gate) note(ctx context.Context, err error) {
 	if ctx.Err() == nil {
-		g.setUnmet(unmetOf(err))
+		g.setUnmet(g.unmetOf(err))
 	}
 }
 

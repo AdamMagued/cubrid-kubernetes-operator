@@ -81,6 +81,7 @@ func (r *haRun) newGate() *faults.Gate {
 		Restore:  func(context.Context) error { return r.restoreStartingState() },
 		Verify:   func(context.Context) error { return r.verifyStartingState() },
 		Describe: func(context.Context) string { return r.memberIdentities() },
+		Redact:   func(s string) string { return string(redactor.Redact([]byte(s))) },
 	}
 }
 
@@ -183,8 +184,10 @@ func (r *haRun) verifyStartingState() error {
 	if err != nil {
 		return err
 	}
+	// A condition that is not True is an Unmet of kind condition; a
+	// command or decoding failure stays a plain error, of kind other.
 	if _, err := r.formationTime(); err != nil {
-		return unmet("", faults.UnmetCondition, "%v", err)
+		return err
 	}
 	s, err := r.status()
 	if err != nil {
@@ -225,7 +228,8 @@ func (r *haRun) verifyStartingState() error {
 	r.mu.Unlock()
 	h, err := r.runWorkload("CLIENT_ID=" + marker + " OPS=1 ROLLBACK_EVERY=0")
 	if err != nil {
-		return unmet("rw", faults.UnmetData, "marker write: %v", err)
+		// The client could not run or its history could not be read.
+		return unmet("", faults.UnmetClient, "marker write: %v", err)
 	}
 	if h.Counts[workload.Acknowledged] != 1 {
 		return unmet("rw", faults.UnmetData, "the marker write was not acknowledged: %v", h.Counts)
@@ -242,18 +246,22 @@ func (r *haRun) verifyStartingState() error {
 	if err != nil {
 		return err
 	}
-	// The first violation names the member and the rule; the whole report
-	// is in the data checks of the steps.
-	member, v, total := report.FirstViolation()
+	// The first violation names the member and the rule, a violation of the
+	// marker row and a member before an endpoint; the whole report is in the
+	// data checks of the steps.
+	member, v, total := report.FirstViolation(append(slices.Clone(r.members), "rw", "ro"), marker+"-")
 	if total == 0 {
 		return unmet("", faults.UnmetData, "the data rules were checked on no member")
 	}
-	row := "row"
-	if strings.HasPrefix(v.OpID, marker+"-") {
-		row = "marker row"
+	what := v.Rule
+	switch {
+	case strings.HasPrefix(v.OpID, marker+"-"):
+		what += " marker row " + v.OpID
+	case v.OpID != "":
+		what += " row " + v.OpID
 	}
-	return unmet(member, faults.UnmetData, "%s %s %s within a minute: %s (%d violations in all, marker %s)",
-		v.Rule, row, v.OpID, v.Detail, total, marker)
+	return unmet(member, faults.UnmetData, "%s within a minute: %s (%d violations in all, marker %s)",
+		what, v.Detail, total, marker)
 }
 
 // needsFirstMemberAsMaster is the order dependency of S03

@@ -276,7 +276,7 @@ func (r *haRun) formationTime() (time.Duration, error) {
 				continue
 			}
 			if c.Status != "True" {
-				return 0, fmt.Errorf("condition %s is %s", want, c.Status)
+				return 0, &faults.Unmet{Kind: faults.UnmetCondition, Detail: fmt.Sprintf("%s is %s", want, c.Status)}
 			}
 			found = true
 			if c.LastTransitionTime.After(last) {
@@ -284,7 +284,7 @@ func (r *haRun) formationTime() (time.Duration, error) {
 			}
 		}
 		if !found {
-			return 0, fmt.Errorf("condition %s is not reported", want)
+			return 0, &faults.Unmet{Kind: faults.UnmetCondition, Detail: want + " is not reported"}
 		}
 	}
 	return last.Sub(cluster.Metadata.CreationTimestamp), nil
