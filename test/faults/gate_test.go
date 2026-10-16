@@ -18,10 +18,13 @@ package faults
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // fakeSystem is a shared system whose starting state holds from a given
@@ -219,6 +222,77 @@ func TestGate_NeverHangs(t *testing.T) {
 	}
 	if later := g.Enter(context.Background(), "S15", nil); later.Verified || later.Reason != e.Reason {
 		t.Errorf("a later variant was not blocked for the same reason: %+v", later)
+	}
+}
+
+// markerMissing is the failing condition of a starting state whose marker
+// row did not reach a slave.
+var markerMissing = &Unmet{Member: "hab-2", Kind: UnmetData,
+	Detail: "missing gate31-000001: acknowledged to the client and not found (2 violations in all)"}
+
+// A check that does not hold within its limit names its last failing
+// condition, the member and the rule, in its entry (starting-state.jsonl)
+// and in the reason (summary.json), also when the last check did not stop.
+func TestGate_ATimeoutNamesTheLastFailingCondition(t *testing.T) {
+	for name, hang := range map[string]bool{"not restored": false, "still running": true} {
+		t.Run(name, func(t *testing.T) {
+			calls := 0
+			g := &Gate{Limit: 60 * time.Millisecond, Poll: 5 * time.Millisecond, Stop: 20 * time.Millisecond,
+				Verify: func(context.Context) error {
+					calls++
+					switch {
+					case calls == 1:
+						return &Unmet{Member: "hab-1", Kind: UnmetRole, Detail: "neither an active master nor a standby slave"}
+					case hang && calls > 2:
+						select {}
+					}
+					return fmt.Errorf("the data rules do not hold: %w", markerMissing)
+				}}
+			e := g.Enter(context.Background(), "S14-token-rotation", nil)
+			if e.Verified || e.Unmet == nil || *e.Unmet != *markerMissing {
+				t.Fatalf("want the last failing condition %+v in the entry, got %+v", markerMissing, e)
+			}
+			line, err := json.Marshal(e)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{
+				`"lastFailingCondition":{`, `"member":"hab-2"`, `"kind":"data"`, `missing gate31-000001`,
+			} {
+				if !strings.Contains(string(line), want) {
+					t.Errorf("the record does not contain %s: %s", want, line)
+				}
+			}
+			for _, want := range []string{"hab-2", "missing gate31-000001"} {
+				if !strings.Contains(e.Reason, want) {
+					t.Errorf("the reason does not name %q: %s", want, e.Reason)
+				}
+			}
+		})
+	}
+}
+
+// The failing condition kept is bounded: a long detail, such as a whole data
+// report, is cut.
+func TestGate_TheFailingConditionIsBounded(t *testing.T) {
+	long := strings.Repeat("ö", 4*MaxUnmetDetail)
+	g := &Gate{Limit: 30 * time.Millisecond, Poll: 5 * time.Millisecond,
+		Verify: func(context.Context) error { return errors.New(long) }}
+	e := g.Enter(context.Background(), "S14", nil)
+	if e.Unmet == nil {
+		t.Fatalf("want a failing condition, got %+v", e)
+	}
+	if e.Unmet.Kind != UnmetOther || len(e.Unmet.Detail) > MaxUnmetDetail+64 ||
+		!utf8.ValidString(e.Unmet.Detail) || !strings.Contains(e.Unmet.Detail, "bytes cut") {
+		t.Fatalf("want a bounded detail, got %d bytes: %+v", len(e.Unmet.Detail), e.Unmet)
+	}
+	if len(e.Reason) > 2*MaxUnmetDetail+256 {
+		t.Errorf("the reason is not bounded: %d bytes", len(e.Reason))
+	}
+	// A starting state that holds keeps no failing condition.
+	ok := &fakeSystem{holdsFrom: 2}
+	if e := ok.gate().Enter(context.Background(), "S02", nil); !e.Verified || e.Unmet != nil {
+		t.Errorf("a verified entry carries a failing condition: %+v", e)
 	}
 }
 

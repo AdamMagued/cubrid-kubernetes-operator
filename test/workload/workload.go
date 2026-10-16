@@ -116,6 +116,23 @@ type Report struct {
 	Diverged            []Violation            `json:"diverged"`
 }
 
+// FirstViolation returns the first violation of the report: of the members
+// and endpoints in name order, then of the divergence between them, where
+// member is empty. total counts every violation; it is 0 when there is none.
+func (r Report) FirstViolation() (member string, first Violation, total int) {
+	for _, name := range slices.Sorted(maps.Keys(r.Members)) {
+		v := r.Members[name].Violations
+		if total == 0 && len(v) > 0 {
+			member, first = name, v[0]
+		}
+		total += len(v)
+	}
+	if total == 0 && len(r.Diverged) > 0 {
+		first = r.Diverged[0]
+	}
+	return member, first, total + len(r.Diverged)
+}
+
 // Data rules, as they appear in a Violation.
 const (
 	RuleMissing           = "missing"

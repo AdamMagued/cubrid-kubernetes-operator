@@ -150,11 +150,12 @@ func (r *haRun) master() (string, []string, error) {
 		case strings.Contains(out, "current "+pod+", state slave") && strings.Contains(out, "registered_and_standby"):
 			slaves = append(slaves, pod)
 		default:
-			return "", nil, fmt.Errorf("%s is neither an active master nor a standby slave:\n%s", pod, out)
+			return "", nil, &faults.Unmet{Member: pod, Kind: faults.UnmetRole,
+				Detail: "neither an active master nor a standby slave:\n" + out}
 		}
 	}
 	if len(masters) != 1 || len(slaves) != len(r.members)-1 {
-		return "", nil, fmt.Errorf("masters %v, slaves %v", masters, slaves)
+		return "", nil, &faults.Unmet{Kind: faults.UnmetRole, Detail: fmt.Sprintf("masters %v, slaves %v", masters, slaves)}
 	}
 	return masters[0], slaves, nil
 }

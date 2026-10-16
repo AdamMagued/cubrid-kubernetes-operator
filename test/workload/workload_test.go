@@ -344,3 +344,24 @@ func TestCheckReadOnlyRefusal(t *testing.T) {
 		t.Error("two writes: judged as one refusal")
 	}
 }
+
+// The first violation names the member and the rule, members in order, and
+// counts every violation, so that a check that does not hold says where.
+func TestReport_FirstViolation(t *testing.T) {
+	h := mustHistory(t)
+	// c1-2 is missing on memberB and through rw: two violations of the
+	// members and one divergence.
+	report := Check(h, map[string][]Row{memberB: {row(1, 10, "n1")}, memberA: good(), "rw": {row(1, 10, "n1")}})
+	missing := row(2, 20, "n2").OpID
+	if member, v, total := report.FirstViolation(); member != memberB || v.Rule != RuleMissing ||
+		v.OpID != missing || total != 3 {
+		t.Errorf("FirstViolation = %s %+v of %d, want missing %s on %s of 3", member, v, total, missing, memberB)
+	}
+	differ := Check(h, map[string][]Row{memberA: good(), memberB: append(good(), row(4, 40, "n4"))})
+	if member, v, total := differ.FirstViolation(); member != "" || v.Rule != RuleMembersDiverge || total != 1 {
+		t.Errorf("FirstViolation = %q %+v of %d, want the divergence", member, v, total)
+	}
+	if _, _, total := Check(h, map[string][]Row{memberA: good()}).FirstViolation(); total != 0 {
+		t.Errorf("a report that holds has %d violations", total)
+	}
+}
