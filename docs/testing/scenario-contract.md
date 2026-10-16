@@ -181,7 +181,21 @@ dependency is checked explicitly: S03 `abrupt-first-member` needs the first
 member as master, and is `blocked` with `order_dependency_broken` when it is
 not, without blocking the steps after it. Every decision, with the time the
 restore took and the UID and restart count of each member's Pod, is kept in
-`ha-bootstrap/starting-state.jsonl`.
+`ha-bootstrap/starting-state.jsonl`. When the starting state is not verified
+within the limit, its record keeps the condition the last check that
+returned found not holding, as `lastFailingCondition`: the member it
+concerns, if any, its kind (`pod`, `role`, `condition`, `broker`,
+`operator`, `client`, `data`, or `other` for a failure that names no
+condition, such as a command that could not run) and what failed, for a data
+rule the rule and the row, for example `missing` of the marker row
+`gate31-000001` on `hab-2`. A violation of the marker row is named before
+others, and a member before the `rw` and `ro` endpoints. The blocked reason
+in `summary.json` names it too, also with `step_still_running` when the last
+check did not stop. A check cut short by the limit does not replace the
+condition an earlier check found. Only the last condition is kept, its
+detail is cut at 512 bytes and the reason at about 1 KiB; both are redacted
+before they are cut, so that a cut does not leave part of a secret, and
+again when the evidence files are written.
 
 To see this on Kind, `E2E_BREAK_STEP=<label>` (the label of an HA step
 after S01, for example `S05-one-broker-pod`) makes that step fail on purpose
