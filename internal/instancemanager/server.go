@@ -110,6 +110,11 @@ type Server struct {
 	notReady string
 	// timeouts are the per-operation deadlines.
 	timeouts Timeouts
+	// heartbeatProcesses lists the processes that run now, and
+	// heartbeatSettle is the time between the two observations a heartbeat
+	// start needs (observeStartable).
+	heartbeatProcesses func() (map[string]bool, error)
+	heartbeatSettle    time.Duration
 }
 
 func NewServer(cli CLI, token string) *Server {
@@ -117,6 +122,7 @@ func NewServer(cli CLI, token string) *Server {
 	return &Server{
 		cli: cli, token: token, timeouts: Timeouts{}.withDefaults(), pollStatus: map[string]int{},
 		opsCtx: opsCtx, endOps: endOps,
+		heartbeatProcesses: RunningProcesses, heartbeatSettle: heartbeatSettle,
 	}
 }
 
@@ -703,9 +709,11 @@ func (s *Server) runRestore(id string, req RestoreRequest) {
 // stopped: in a recovery bootstrap it started nothing and runs only once, and
 // it starts no database that carries an ownership marker. A standalone
 // member's server is started; a configured HA member joins HA, with
-// `cubrid heartbeat start` issued only when heartbeat status exited by itself
-// without HA node information (observeHeartbeat); a status that did not
-// answer starts nothing and is an error. before runs ahead of
+// `cubrid heartbeat start` issued only when observeStartable allows it: two
+// rounds, heartbeatSettle apart, of a heartbeat status that exited by itself
+// without HA node information and a process table without any of
+// heartbeatVeto. A round that did not answer, or that sees such a process,
+// starts nothing and is an error. before runs ahead of
 // each start command, and an error from it stops before that command; nil
 // runs nothing.
 func (s *Server) startRestoredDatabase(ctx context.Context, database string, haMember bool, before func() error) error {
@@ -723,7 +731,7 @@ func (s *Server) startRestoredDatabase(ctx context.Context, database string, haM
 	if !haMember {
 		return nil
 	}
-	hb := observeHeartbeat(ctx, s.cli)
+	hb := s.observeStartable(ctx)
 	if !hb.startable && !hb.running {
 		return errors.New(hb.reason + "; heartbeat start was not issued")
 	}

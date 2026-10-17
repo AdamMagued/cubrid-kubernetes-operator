@@ -120,9 +120,10 @@ type heartbeatObservation struct {
 // is started on it (ADR-0005): a timeout, a cancellation, a signal, a command
 // that could not be run, or output that could not be read.
 //
-// That a status which ran to its end without HA node information means
-// inactive heartbeat is an assumption: the output of an HA member whose
-// heartbeat is not active is not recorded in docs/poc (#345).
+// A status that ran to its end without HA node information is necessary for a
+// start, not enough: it printed the same while heartbeat was never started and
+// while a start or a stop was under way (docs/poc/RESULTS.md, POC-26).
+// observeStartable adds what tells them apart.
 func observeHeartbeat(ctx context.Context, cli CLI) heartbeatObservation {
 	out, err := cli.Run(ctx, "cubrid", "heartbeat", "status")
 	if heartbeatReport.MatchString(out) {
@@ -147,6 +148,72 @@ func observeHeartbeat(ctx context.Context, cli CLI) heartbeatObservation {
 		return heartbeatObservation{reason: "heartbeat status did not answer: " + why.Error()}
 	}
 	return heartbeatObservation{startable: true}
+}
+
+// heartbeatSettle is the default time between the two observations a
+// heartbeat start needs. In POC-26 status printed no HA node information up
+// to 159 ms into a start (state 4d, a start right after a service stop), and
+// the processes of a stop ran for about 1 s after it did; 2 s is above both,
+// on one local host without load.
+const heartbeatSettle = 2 * time.Second
+
+// heartbeatVeto are the processes that forbid a heartbeat start while status
+// prints no HA node information (docs/poc/RESULTS.md, POC-26): cub_master ran
+// in the first B answers of 10 of 11 starts, and cub_server and cub_pl ran on
+// after cub_master during a service stop, cub_pl for about 1 s, as long as
+// copylogdb and applylogdb. Those two run as cub_admin, which is no veto: the
+// manager's own utilities, such as applyinfo for /v1/ha/convergence, may run
+// under that name too, and would fail operations for nothing. Nor does the
+// manager's own createdb or restoredb leave a veto behind: on cubrid/cubrid:11.4
+// (local Docker, one standalone container, a few runs) /proc showed no cub*
+// process when sampled every 100 ms for 1 s after createdb and 0.6 s after
+// each of 3 restoredb -u runs exited 0. Names match exactly.
+var heartbeatVeto = []string{"cub_master", "cub_server", "cub_pl"}
+
+// observeStartable decides whether `cubrid heartbeat start` may be issued
+// now. The start is issued only when two observations, heartbeatSettle apart,
+// each print no HA node information (observeHeartbeat) and see none of
+// heartbeatVeto running: one answer cannot tell a member whose heartbeat was
+// never started from one whose start or stop is under way (POC-26). A process
+// table that cannot be read starts nothing, and the wait ends with ctx, so a
+// stop ends it. Known limits: a start issued outside the manager while
+// cub_master comes and goes (POC-26 state 4b) passes when both process
+// snapshots miss it, and a start or a stop from outside the manager that
+// begins after the second snapshot and before the start command is not seen
+// (check, then act). The shutdown fallback that runs in another process
+// before the manager listens is #323.
+func (s *Server) observeStartable(ctx context.Context) heartbeatObservation {
+	hb := s.observeQuiet(ctx)
+	if !hb.startable {
+		return hb
+	}
+	settle := time.NewTimer(s.heartbeatSettle)
+	defer settle.Stop()
+	select {
+	case <-ctx.Done():
+		return heartbeatObservation{reason: "the wait between two heartbeat status calls ended: " + ctx.Err().Error()}
+	case <-settle.C:
+	}
+	return s.observeQuiet(ctx)
+}
+
+// observeQuiet is one observation of observeStartable.
+func (s *Server) observeQuiet(ctx context.Context) heartbeatObservation {
+	hb := observeHeartbeat(ctx, s.cli)
+	if !hb.startable {
+		return hb
+	}
+	running, err := s.heartbeatProcesses()
+	if err != nil {
+		return heartbeatObservation{reason: "the process list could not be read: " + err.Error()}
+	}
+	for _, name := range heartbeatVeto {
+		if running[name] {
+			return heartbeatObservation{reason: "heartbeat status printed no HA node information, but " + name +
+				" runs: a start or a stop may be under way"}
+		}
+	}
+	return hb
 }
 
 // engineVersionPattern matches the full version in cubrid_rel output:

@@ -181,7 +181,7 @@ func (s *Server) runHABootstrap(id string, req HABootstrapRequest) {
 		// status that did not answer, and running heartbeat that does not
 		// report a confirmed role, fail the bootstrap without a start; the
 		// operator asks again within its attempt limit.
-		hb := observeHeartbeat(ctx, s.cli)
+		hb := s.observeStartable(ctx)
 		switch {
 		case !hb.startable && !hb.running:
 			fail(hb.reason + "; heartbeat start was not issued")

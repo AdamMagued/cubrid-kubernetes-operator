@@ -57,8 +57,11 @@ func (c *volumeCLI) Run(ctx context.Context, name string, args ...string) (strin
 // whose manager can be restarted on the same operation store and database
 // root.
 type resumeFixture struct {
-	t         *testing.T
-	haConf    string
+	t      *testing.T
+	haConf string
+	// processes is the process table the manager reads; nil is one without
+	// any CUBRID process.
+	processes func() (map[string]bool, error)
 	objects   ObjectStore
 	req       RestoreRequest
 	storeDir  string
@@ -87,6 +90,10 @@ func (f *resumeFixture) start(cli CLI) {
 		f.server = f.server.WithHAConfig(HAConfig{ConfPath: f.haConf})
 	} else {
 		f.server = f.server.WithStandaloneDatabase(dbName)
+	}
+	f.server.heartbeatProcesses, f.server.heartbeatSettle = processTable(), 0
+	if f.processes != nil {
+		f.server.heartbeatProcesses = f.processes
 	}
 	f.handler = f.server.Handler()
 }
