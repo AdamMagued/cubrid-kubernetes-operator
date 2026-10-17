@@ -62,7 +62,10 @@ type RoleObservation struct {
 	// Reason says why the answer gives no role that counts: the request that
 	// failed, the status the member answered, what its Instance Manager said
 	// of a role it does not report, or how the answer contradicts itself.
-	// It is empty for an answer with a role and never carries a token.
+	// It is empty for an answer with a role. The Operator never puts a token
+	// into it. Text from the member or the network is made one line and cut
+	// to maxErrorMessage runes (cleanMessage), not scrubbed: what a member
+	// sends is kept up to the cut as it is.
 	Reason string
 	// RequestID is the ID the role query was sent with; empty when none was
 	// sent.
@@ -181,7 +184,10 @@ func observationFromStatus(st instancemanager.HAStatus, at time.Time) RoleObserv
 	}
 	if st.Role != instancemanager.RoleMaster && st.Role != instancemanager.RoleSlave {
 		if st.Role == instancemanager.RoleUnknown || st.Role == "" {
-			o.Reason = "the Instance Manager reported no role: " + cleanMessage(st.Reason)
+			o.Reason = "the Instance Manager reported no role"
+			if why := cleanMessage(st.Reason); why != "" {
+				o.Reason += ": " + why
+			}
 		}
 		return o
 	}

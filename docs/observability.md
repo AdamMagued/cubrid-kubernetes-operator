@@ -251,13 +251,35 @@ underscores.
 | `ReplicationHealthy` becomes `False` | `ReplicationStalled` or `ApplyFailures` | Warning | `replication_stalled`, `apply_failures` |
 | `ReplicationHealthy` becomes `True` again | `ReplicationRecovered` | Normal | `replication_recovered` |
 | A member's role changes; a member first listed with the role `unknown`, as a standalone member always is, is no change | none | | `member_role_changed` |
-| A member whose role was known gives no answer that counts: its role becomes `unknown` | none | | `member_role_unobserved`, with `oldRole` and the `reason`: the request that failed, the status the member answered (401 for a refused token), the reason its Instance Manager gave for reporting no role, how the answer contradicts itself, or that it is older than 15 seconds; and the `requestID` of the role query when one was sent |
+| A member whose role was known gives no answer that counts: its role becomes `unknown` | none | | `member_role_unobserved`, with `oldRole`, the `reason` and the `requestID` of the role query when one was sent (see below) |
 | Any other Condition changes its status or reason | none | | `condition_changed` |
 | The bootstrap reaches its next phase | `DatabaseCreated`, `DatabaseRestored` (a recovery restore completed and seeding starts), `PeersSeeded` | Normal | `bootstrap_phase_changed` |
 | A member is copied from another member than the one the database was created or restored on, because that member is no longer the master | `SeedSourceChanged` | Normal | `condition_changed` (`BootstrapReady`, reason `SeedSourceSelected`) |
 | A member is replaced for a new image | `RollingUpdate` | Normal | `rolling_update` |
 | A CubridBackup reaches a phase: `Pending`, `Running`, `Uploading`, `Completed`, `Failed` | on the CubridBackup: `BackupPending`, `BackupStarted`, `BackupUploading`, `BackupCompleted`, `BackupFailed` | Normal; `BackupFailed` is a Warning | `backup_pending`, `backup_started`, `backup_uploading`, `backup_completed`, `backup_failed` |
 | A recovery bootstrap takes a step: a restore operation is started (once for each attempt), restoredb begins after the download, the recovery ends | `RestoreStarted`, `RestoreRunning`, `RestoreCompleted`, `RestoreFailed` | Normal; `RestoreFailed` is a Warning | `restore_started`, `restore_running`, `restore_completed`, `restore_failed` |
+
+The `reason` of `member_role_unobserved` is one of:
+
+| `reason` | Meaning |
+|---|---|
+| the request's error, for example `Get "http://<member>.<namespace>.svc:9090/v1/role": dial tcp: ... no such host` | The role query could not be sent or got no answer |
+| the error that the member's token could not be read with | The member was not asked |
+| `status <code>`, for example `status 401` | The Instance Manager answered with an error status; 401 refuses the token |
+| `unreadable answer` | The answer was not a role answer |
+| `the Instance Manager reported no role`, followed by `: ` and the reason it gave when it gave one, for example `current node state 'unknown' is not an authoritative role` | The member does not report an authoritative role |
+| `the answer names the member <name>` | The answer came from another member |
+| `the role <role> contradicts the HA node list` | The answer contradicts itself |
+| `a master whose server is not registered_and_active` | The member reports itself master while its server is not active |
+| `the answer is older than 15s` | The answer came too long ago to count |
+| `no answer`, `the member was not asked` | No answer was recorded for another cause |
+
+The member's text and the request's error are made one line and, when
+longer, cut to 256 characters followed by `...`; they are not otherwise
+changed. The line is logged when the
+role changes, in the reconcile that observed it. If that reconcile could not
+write the status, the next one starts from the role stored before and logs
+the line again.
 
 The `BackupFailed` Event carries the message of the CubridBackup's `Ready`
 condition. A backup whose start was not confirmed within 30 minutes
