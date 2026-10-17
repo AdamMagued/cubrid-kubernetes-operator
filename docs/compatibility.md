@@ -30,6 +30,29 @@ narrow for the MVP and are widened only after they are validated in CI.
 
 See [DESIGN.md §20 "Cluster Providers"](../DESIGN.md).
 
+## Development images
+
+The `Development Images` workflow (`.github/workflows/dev-images.yml`) builds
+the manager and Instance Manager images of every commit pushed to `main` and
+pushes them to GHCR, tagged with the full commit SHA:
+
+- `ghcr.io/cubrid-lab/cubrid-kubernetes-operator/manager:main-<full sha>`
+- `ghcr.io/cubrid-lab/cubrid-kubernetes-operator/instance-manager:main-<full sha>`
+
+They are built from the same Dockerfiles and build arguments as
+`make docker-build` and `make docker-build-instance-manager`, for linux/amd64
+only, and carry the `org.opencontainers.image.source`, `revision` and
+`created` labels. The job summary of each run lists both digests; pin an
+image by digest when a record must name exactly what ran. A manual run
+(`workflow_dispatch`) builds only a commit that is on `main`. No `latest` or
+other mutable tag is pushed, and pull requests never push images.
+
+These are development images, not releases: they carry no compatibility or
+support claim. Release candidates, versioned tags, signing and publication
+are tracked in #123 and #124. The built-in default Instance Manager image
+stays `:dev`; to use a development image, pass it to the manager with
+`--instance-manager-image`.
+
 ## Versioning
 
 - API version: `v1alpha1` — breaking changes may occur between alpha
