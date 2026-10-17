@@ -251,6 +251,7 @@ underscores.
 | `ReplicationHealthy` becomes `False` | `ReplicationStalled` or `ApplyFailures` | Warning | `replication_stalled`, `apply_failures` |
 | `ReplicationHealthy` becomes `True` again | `ReplicationRecovered` | Normal | `replication_recovered` |
 | A member's role changes; a member first listed with the role `unknown`, as a standalone member always is, is no change | none | | `member_role_changed` |
+| A member whose role was known gives no answer that counts: its role becomes `unknown` | none | | `member_role_unobserved`, with `oldRole` and the `reason`: the request that failed, the status the member answered (401 for a refused token), the reason its Instance Manager gave for reporting no role, how the answer contradicts itself, or that it is older than 15 seconds; and the `requestID` of the role query when one was sent |
 | Any other Condition changes its status or reason | none | | `condition_changed` |
 | The bootstrap reaches its next phase | `DatabaseCreated`, `DatabaseRestored` (a recovery restore completed and seeding starts), `PeersSeeded` | Normal | `bootstrap_phase_changed` |
 | A member is copied from another member than the one the database was created or restored on, because that member is no longer the master | `SeedSourceChanged` | Normal | `condition_changed` (`BootstrapReady`, reason `SeedSourceSelected`) |
