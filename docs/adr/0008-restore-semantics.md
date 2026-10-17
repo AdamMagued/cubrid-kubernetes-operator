@@ -291,9 +291,13 @@ rewrites the marker with its own ID) and only starts the database again,
 without a second `restoredb`. Any other request for that target, and an HA
 bootstrap, is refused and the data is left for a person. Only a restore that
 failed before its data was recorded, and so was never started, is removed and
-restored again. A seeding retry that takes a new seed backup from the master
-is a different request, so it is refused in the same way while the restored
-data of the earlier attempt is in place.
+restored again. A seeding retry from the same source in the same round sends
+the same request body under its new key (the seed location names the source
+and the round, not the attempt), so it is the same request: it takes over the
+data the earlier attempt restored and only starts it, and the new seed backup
+that the retry took is not restored. A seeding retry from another source, or
+in another round, is a different request, so it is refused in the same way
+while the restored data of the earlier attempt is in place.
 
 When the marker of a restore recorded `Completed` is still there (the
 operation was recorded, then the marker could not be removed), the entrypoint
@@ -304,9 +308,9 @@ it serves any request: the database is started as the restore started it
 HA member whose `cubrid heartbeat status` exited by itself without HA node
 information twice, 2 seconds apart, with none of `cub_master`, `cub_server`
 and `cub_pl` running; a status that did not answer, or a CUBRID process that
-runs, starts nothing and counts as a failed start, ADR-0010), and only then
-is the marker
-removed, so a start that fails is tried again at the next start of the
+runs, starts nothing and counts as a failed start, and so does heartbeat that
+already runs without reporting the member in a confirmed role (master, slave
+or replica), ADR-0010), and only then is the marker removed, so a start that fails is tried again at the next start of the
 manager. A marker of any other operation is left for the next operation.
 
 Runbook for restored data left for a person: read the operation the marker
@@ -316,6 +320,17 @@ discard it, first stop the database and make sure no CUBRID process of it is
 left (`cubrid heartbeat stop` or `cubrid server stop <db>`, then no
 `cub_server` for it), then remove the `<db>` directory and its
 `databases.txt` line; the next attempt restores into the empty target.
+
+Runbook for the failure reason "heartbeat runs without a confirmed role" on an
+HA member: heartbeat runs there, but in no role (for example `state unknown`),
+and a restore or its start at a manager start does not complete on it. In
+POC-26 (`cubrid/cubrid:11.4`, 11.4.6.1963, one image) `cubrid heartbeat stop`
+and a failed `cubrid heartbeat start` left `state unknown` with `cub_master`
+alive, and a second start while `cub_master` stayed failed as well. The way
+back to a state in which heartbeat may be started is to stop `cub_master` on
+that member (`cubrid service stop`), then let the operator retry, or start
+the database by hand and remove `<db>/.im-operation`. That this is enough on
+other images or states is not shown.
 
 ### Validation gate (before Ready)
 

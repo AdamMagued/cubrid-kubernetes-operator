@@ -112,6 +112,24 @@ type heartbeatObservation struct {
 	reason string
 }
 
+// startError says why nothing may follow this observation, or nil. A status
+// that did not answer, or a CUBRID process that runs, issues no start; nor
+// does heartbeat that runs without reporting the current node in a confirmed
+// role (master, slave or replica), which neither is started again nor counts
+// as joined: a transition, or the stable `state unknown` after a heartbeat
+// stop or a failed start (docs/poc/RESULTS.md, POC-26). nil means a start may
+// be issued (startable) or heartbeat already runs in a confirmed role. The HA
+// bootstrap and the start of a restored database share this rule.
+func (hb heartbeatObservation) startError() error {
+	switch {
+	case !hb.startable && !hb.running:
+		return errors.New(hb.reason + "; heartbeat start was not issued")
+	case hb.running && hb.status.Role == RoleUnknown:
+		return errors.New(hb.reason + ": heartbeat runs without a confirmed role; heartbeat start was not issued")
+	}
+	return nil
+}
+
 // observeHeartbeat runs `cubrid heartbeat status` once. An unknown role is
 // not enough to start heartbeat: output with HA node information, in any
 // state, means heartbeat runs, and a second start while it activates flips it
