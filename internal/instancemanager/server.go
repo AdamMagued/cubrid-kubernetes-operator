@@ -714,10 +714,9 @@ func (s *Server) runRestore(id string, req RestoreRequest) {
 // without HA node information and a process table without any of
 // heartbeatVeto. A round that did not answer, or that sees such a process,
 // starts nothing and is an error. Heartbeat that already runs is not started
-// again; it counts as joined only when it reports the current node in a
-// confirmed role, as the HA bootstrap requires. In any other state, such as
-// the stable `state unknown` after a heartbeat stop or a failed start
-// (docs/poc/RESULTS.md, POC-26), it is an error. before runs ahead of
+// again and counts as joined only in a confirmed role; any other state is an
+// error, by the rule the HA bootstrap shares (heartbeatObservation.startError).
+// before runs ahead of
 // each start command, and an error from it stops before that command; nil
 // runs nothing.
 func (s *Server) startRestoredDatabase(ctx context.Context, database string, haMember bool, before func() error) error {
@@ -736,11 +735,8 @@ func (s *Server) startRestoredDatabase(ctx context.Context, database string, haM
 		return nil
 	}
 	hb := s.observeStartable(ctx)
-	switch {
-	case !hb.startable && !hb.running:
-		return errors.New(hb.reason + "; heartbeat start was not issued")
-	case hb.running && hb.status.Role == RoleUnknown:
-		return errors.New(hb.reason + ": heartbeat runs without a confirmed role; heartbeat start was not issued")
+	if err := hb.startError(); err != nil {
+		return err
 	}
 	if hb.startable {
 		if err := before(); err != nil {

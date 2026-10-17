@@ -88,8 +88,8 @@ issued only when `cubrid heartbeat status` exited by itself, its output was
 read, and the output carries no HA node information (no `HA-Node Info`
 header and no `Node <name> (priority ...` line). HA node information in any
 form means heartbeat runs and nothing is started: the bootstrap completes
-when it reports the member as master or slave, and fails with the observed
-state otherwise (a transition such as `to-be-master`, or `unknown` after a
+when it reports the member in a confirmed role (master, slave or replica),
+and fails with the observed state otherwise (a transition such as `to-be-master`, or `unknown` after a
 failed start). A status that did not answer (a timeout, a cancellation, a
 signal, a command that could not be run, or output that could not be read)
 fails the bootstrap without a start. A failed bootstrap is asked again
@@ -109,10 +109,16 @@ stop asked for during the 2 seconds ends the wait, and nothing is started.
 The same rules hold for the heartbeat start of a restored member (ADR-0008),
 including the rule for running heartbeat: a restore, or the start of a
 completed restore's database when the manager starts, counts as done only when
-heartbeat reports the member as master or slave. Any other state, such as
-`unknown`, which POC-26 saw stay after `cubrid heartbeat stop` and after a
-failed start, fails it without a start; the restored data and its ownership
-marker are kept (#454).
+heartbeat reports the member in a confirmed role (master, slave or replica).
+Any other state, such as `unknown`, which POC-26 saw stay after
+`cubrid heartbeat stop` and after a failed start, fails it without a start;
+the restored data and its ownership marker are kept (#454).
+Known limit: an attempt that is cut off while its `cubrid heartbeat start`
+still runs (a manager restart, a timeout) leaves heartbeat activating, and the
+next attempt can see a `to-be-*` or `unknown` state, fail on it and use up an
+attempt; on the seeding path each such retry also takes a new seed backup.
+Whether this exhausts the attempt limit in practice is not shown, and no
+extra retry is made for it.
 Known limit: a start issued outside the Instance Manager while `cub_master`
 comes and goes (POC-26 state 4b, for example a person running
 `cubrid heartbeat start` in the container) passes when both process
