@@ -302,8 +302,10 @@ Instance Manager therefore looks for such markers once when it starts, before
 it serves any request: the database is started as the restore started it
 (`cubrid server start` on a standalone member, `cubrid heartbeat start` on an
 HA member whose `cubrid heartbeat status` exited by itself without HA node
-information; a status that did not answer starts nothing and counts as a
-failed start, ADR-0010), and only then is the marker
+information twice, 2 seconds apart, with none of `cub_master`, `cub_server`
+and `cub_pl` running; a status that did not answer, or a CUBRID process that
+runs, starts nothing and counts as a failed start, ADR-0010), and only then
+is the marker
 removed, so a start that fails is tried again at the next start of the
 manager. A marker of any other operation is left for the next operation.
 

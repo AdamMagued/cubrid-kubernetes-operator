@@ -94,9 +94,22 @@ failed start). A status that did not answer (a timeout, a cancellation, a
 signal, a command that could not be run, or output that could not be read)
 fails the bootstrap without a start. A failed bootstrap is asked again
 within the operator's attempt limit (#274). A status without HA node
-information is recorded on the engine for a member where nothing runs
-(docs/poc/RESULTS.md, POC-26); a start or a stop under way also prints it
-(#452). Ordinal 0 is
+information is necessary for the start, not enough: on the engine it is what
+a member where nothing runs prints, and also what a start or a stop under way
+prints (docs/poc/RESULTS.md, POC-26). The start is therefore issued only when
+two such statuses, 2 seconds apart, each find none of `cub_master`,
+`cub_server` and `cub_pl` running; otherwise, or when the process list cannot
+be read, the bootstrap fails without a start. `cub_pl` ran as long as
+copylogdb and applylogdb, about 1 second after `cub_master` was gone during a
+`cubrid service stop`. Those two run as `cub_admin`, which is not checked,
+because the manager's own utilities (`applyinfo`) may run under that name. A
+stop asked for during the 2 seconds ends the wait, and nothing is started.
+The same rule holds for the heartbeat start of a restored member (ADR-0008).
+Known limit: a start issued outside the Instance Manager while `cub_master`
+comes and goes (POC-26 state 4b, for example a person running
+`cubrid heartbeat start` in the container) passes when both process
+snapshots miss `cub_master`. The 2 seconds were measured against one local
+host without load. Ordinal 0 is
 only where the database is created; which member is master afterwards is
 CUBRID's decision. A standalone member's entrypoint runs `createdb` itself,
 inside the ownership marker described below with a value that is not an

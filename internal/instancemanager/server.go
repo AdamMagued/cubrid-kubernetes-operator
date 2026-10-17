@@ -110,6 +110,11 @@ type Server struct {
 	notReady string
 	// timeouts are the per-operation deadlines.
 	timeouts Timeouts
+	// heartbeatProcesses lists the processes that run now, and
+	// heartbeatSettle is the time between the two observations a heartbeat
+	// start needs (observeStartable).
+	heartbeatProcesses func() (map[string]bool, error)
+	heartbeatSettle    time.Duration
 }
 
 func NewServer(cli CLI, token string) *Server {
@@ -117,6 +122,7 @@ func NewServer(cli CLI, token string) *Server {
 	return &Server{
 		cli: cli, token: token, timeouts: Timeouts{}.withDefaults(), pollStatus: map[string]int{},
 		opsCtx: opsCtx, endOps: endOps,
+		heartbeatProcesses: RunningProcesses, heartbeatSettle: heartbeatSettle,
 	}
 }
 
@@ -723,7 +729,7 @@ func (s *Server) startRestoredDatabase(ctx context.Context, database string, haM
 	if !haMember {
 		return nil
 	}
-	hb := observeHeartbeat(ctx, s.cli)
+	hb := s.observeStartable(ctx)
 	if !hb.startable && !hb.running {
 		return errors.New(hb.reason + "; heartbeat start was not issued")
 	}
