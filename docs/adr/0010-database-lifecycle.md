@@ -106,7 +106,13 @@ copylogdb and applylogdb, about 1 second after `cub_master` was gone during a
 `cubrid service stop`. Those two run as `cub_admin`, which is not checked,
 because the manager's own utilities (`applyinfo`) may run under that name. A
 stop asked for during the 2 seconds ends the wait, and nothing is started.
-The same rule holds for the heartbeat start of a restored member (ADR-0008).
+The same rules hold for the heartbeat start of a restored member (ADR-0008),
+including the rule for running heartbeat: a restore, or the start of a
+completed restore's database when the manager starts, counts as done only when
+heartbeat reports the member as master or slave. Any other state, such as
+`unknown`, which POC-26 saw stay after `cubrid heartbeat stop` and after a
+failed start, fails it without a start; the restored data and its ownership
+marker are kept (#454).
 Known limit: a start issued outside the Instance Manager while `cub_master`
 comes and goes (POC-26 state 4b, for example a person running
 `cubrid heartbeat start` in the container) passes when both process

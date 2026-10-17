@@ -243,7 +243,9 @@ func TestServer_Restore_DoesNotRestartRunningHeartbeat(t *testing.T) {
 }
 
 // Heartbeat that reports the local node in a transition is running, and is
-// not started a second time (docs/poc/RESULTS.md, POC-3 and POC-7).
+// not started a second time (docs/poc/RESULTS.md, POC-3 and POC-7). As in the
+// HA bootstrap, a transition is not a confirmed role, and the restore does not
+// complete on it (#454).
 func TestServer_Restore_DoesNotStartHeartbeatInTransition(t *testing.T) {
 	conf := filepath.Join(t.TempDir(), "cubrid_ha.conf")
 	if err := os.WriteFile(conf, []byte(testHAConf), 0o600); err != nil {
@@ -251,8 +253,8 @@ func TestServer_Restore_DoesNotStartHeartbeatInTransition(t *testing.T) {
 	}
 	cli := &stepCLI{output: map[string]string{stepHeartbeatStatus: transitionOut}}
 	final := runRestoreOperation(t, cli, restoreMember{haConf: conf})
-	if final.State != OpCompleted {
-		t.Fatalf("final state = %s (%s), want Completed", final.State, final.FailureReason)
+	if final.State != OpFailed || !strings.Contains(final.FailureReason, "'to-be-master'") {
+		t.Fatalf("final = %s (%s), want Failed naming state 'to-be-master'", final.State, final.FailureReason)
 	}
 	for _, call := range cli.recorded() {
 		if call == callHeartbeatStart {

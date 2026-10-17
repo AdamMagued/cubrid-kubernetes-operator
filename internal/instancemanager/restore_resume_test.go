@@ -432,6 +432,95 @@ func TestResumeCompletedRestores_DoesNotStartHeartbeatWhenStatusDidNotAnswer(t *
 	f.wantRestoredDataKept()
 }
 
+// stateUnknownOut is what `cubrid heartbeat status` printed, with exit 0,
+// after `cubrid heartbeat stop` and after a failed `cubrid heartbeat start`:
+// cub_master stays and HA is not active (docs/poc/RESULTS.md, POC-26, 2a, 4a
+// and 4c).
+const stateUnknownOut = `@ cubrid heartbeat status
+
+ HA-Node Info (current h-0, state unknown)
+
+
+ HA-Process Info (master 344, state unknown)
+
+`
+
+// The restore of an HA member whose heartbeat runs without a confirmed role
+// does not complete: heartbeat is not started again, the operation fails
+// with the reason, and the restored data and its marker are kept. A later
+// attempt of the same request, once heartbeat reports a role, takes that data
+// over and completes without running restoredb again (#454).
+func TestServer_Restore_FailsWhileHeartbeatRunsWithoutAConfirmedRole(t *testing.T) {
+	f := newResumeFixture(t)
+	f.haConf = filepath.Join(t.TempDir(), "cubrid_ha.conf")
+	if err := os.WriteFile(f.haConf, []byte(testHAConf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cli := &volumeCLI{stepCLI: stepCLI{output: map[string]string{stepHeartbeatStatus: stateUnknownOut}}, databases: f.databases}
+	f.start(cli)
+	failed := f.run("restore-1")
+	if failed.State != OpFailed || !strings.Contains(failed.FailureReason, "'unknown'") ||
+		!strings.Contains(failed.FailureReason, "without a confirmed role") {
+		t.Fatalf("restore = %s (%s), want Failed naming state 'unknown' and the missing role", failed.State, failed.FailureReason)
+	}
+	if calls := cli.recorded(); count(calls, callHeartbeatStart) != 0 {
+		t.Errorf("heartbeat was started although it reported state unknown: %q", calls)
+	}
+	if got := f.marker(); got != failed.ID {
+		t.Errorf("marker = %q, want it kept as %q", got, failed.ID)
+	}
+	f.wantRestoredDataKept()
+
+	retry := &volumeCLI{stepCLI: stepCLI{output: map[string]string{stepHeartbeatStatus: masterOut}}, databases: f.databases}
+	f.start(retry)
+	done := f.run("restore-2")
+	if done.State != OpCompleted {
+		t.Fatalf("retry = %s (%s), want Completed", done.State, done.FailureReason)
+	}
+	if calls := retry.recorded(); count(calls, "cubrid restoredb") != 0 || count(calls, callHeartbeatStart) != 0 {
+		t.Errorf("retry calls = %q, want neither restoredb nor a heartbeat start", calls)
+	}
+	f.wantRestoredDataKept()
+}
+
+// On an HA member whose heartbeat runs without a confirmed role, the start of
+// a completed restore's database does not count as done: the error is
+// returned, the marker and the data are kept so that the next start of the
+// manager tries again, and the manager serves all the same (#454).
+func TestResumeCompletedRestores_FailsWhileHeartbeatRunsWithoutAConfirmedRole(t *testing.T) {
+	f := newResumeFixture(t)
+	f.haConf = filepath.Join(t.TempDir(), "cubrid_ha.conf")
+	if err := os.WriteFile(f.haConf, []byte(testHAConf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.start(&volumeCLI{stepCLI: stepCLI{failing: map[string]bool{stepHeartbeatStatus: true}}, databases: f.databases})
+	done := f.run("restore-1")
+	if done.State != OpCompleted {
+		t.Fatalf("restore = %s (%s), want Completed", done.State, done.FailureReason)
+	}
+	marker := filepath.Join(f.databases, dbName, ownershipMarker)
+	if err := os.WriteFile(marker, []byte(done.ID+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := &volumeCLI{stepCLI: stepCLI{output: map[string]string{stepHeartbeatStatus: stateUnknownOut}}, databases: f.databases}
+	f.start(restarted)
+	err := f.server.ResumeCompletedRestores(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "'unknown'") || !strings.Contains(err.Error(), "without a confirmed role") {
+		t.Errorf("ResumeCompletedRestores = %v, want an error naming state 'unknown' and the missing role", err)
+	}
+	if err := f.server.ResumeAndServe(t.Context(), func() error { return nil }); err != nil {
+		t.Errorf("ResumeAndServe = %v, want the manager to serve", err)
+	}
+	if calls := restarted.recorded(); count(calls, callHeartbeatStart) != 0 {
+		t.Errorf("heartbeat was started although it reported state unknown: %q", calls)
+	}
+	if got := f.marker(); got != done.ID {
+		t.Errorf("marker = %q, want it kept as %q", got, done.ID)
+	}
+	f.wantRestoredDataKept()
+}
+
 // A member that is not standalone joins HA after a restore, and what it joins
 // is in its HA configuration. Without a usable one the manager cannot start
 // the database of a completed restore: it starts nothing, returns the error

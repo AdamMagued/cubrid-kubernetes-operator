@@ -304,7 +304,8 @@ it serves any request: the database is started as the restore started it
 HA member whose `cubrid heartbeat status` exited by itself without HA node
 information twice, 2 seconds apart, with none of `cub_master`, `cub_server`
 and `cub_pl` running; a status that did not answer, or a CUBRID process that
-runs, starts nothing and counts as a failed start, ADR-0010), and only then
+runs, starts nothing and counts as a failed start, and so does heartbeat that
+already runs without reporting the member as master or slave, ADR-0010), and only then
 is the marker
 removed, so a start that fails is tried again at the next start of the
 manager. A marker of any other operation is left for the next operation.
