@@ -1017,6 +1017,18 @@ because they move the master.
   event, in a description or in an evidence file.
 - **Data check:** the data rules hold after the last replacement.
 - **Limits:** none; each wait is bounded by the test only.
+- **Failure record:** when `PrimaryResolved` does not stay `True` before any
+  Pod is replaced, `S14/<variant>/overlap-state.txt` keeps what was read just
+  after the failed check: the `PrimaryResolved` condition and
+  `status.instances`, each member's answer to `/v1/role` with the token it
+  holds, its refusal count, its container's restart count and start time,
+  the last lines of its Instance Manager log, and the Operator's last log
+  lines about the cluster's roles and primary, also of an Operator container
+  that ended before the running one, among them `member_role_unobserved`
+  with the reason (docs/observability.md). Each log is cut to its last 60
+  matching lines and the file is redacted; the failure message carries a
+  summary. Taking the record is bounded to 2 minutes, each API request to
+  20 seconds; what could not be read in time is recorded with its error.
 
 ### S15: node drain and PodDisruptionBudget
 
