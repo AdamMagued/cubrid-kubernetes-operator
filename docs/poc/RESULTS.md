@@ -1527,8 +1527,11 @@ under observation. The Instance Manager binary itself was not run: it runs
 the same command, and `observeHeartbeat` decides from its output and exit
 alone.
 
-**Observed — the output shapes.** Each was seen many times; the text did not
-vary apart from pids, node states and process lines:
+**Observed — the output shapes.** Calls seen: A 2 (on `h-0` before the HA
+configuration was written; also POC-10 and POC-12), B and E thousands each,
+C 30 (27 in 4b, 2 in the run of 4b that separated the streams, 1 in 5c), D 2
+(in 5b, in 2 of 6 runs). The text did not vary apart from pids, node states
+and process lines:
 
 | Shape | stdout | stderr | Exit | Time |
 |---|---|---|---|---|
@@ -1565,14 +1568,14 @@ lines:
 | 2e | `cub_server` killed with `SIGKILL` while HA runs | 2 | yes / gone for about 1 s | E throughout, 0; heartbeat started the server again (`not_registered` → `registered_and_standby` → `registered_and_to_be_active`) |
 | 3 | During `cubrid heartbeat start` from nothing running (`h-0` alone, `h-1` joining the master `h-0`, `service start`; includes the starts of 4a and 4c) | 13 | none, then `cub_master` only, then both | **B, 1** in 11 of 13 runs, in the first 10 to 115 ms; in 10 of those 11 the last B call already saw `cub_master` running. Then E, 0, from 37 to 141 ms on (the server appears after about 1.1 s, `heartbeat start` returns after 12 to 13 s). In the other 2 runs the first call took 181 ms and already printed E |
 | 3' | During `cubrid heartbeat start` with `cub_master` still running (after 2c) | 2 | yes / appears | E throughout, 0 |
-| 4a | `heartbeat start` with `ha_db_list` naming an unregistered database | 1 | yes / no | During: B, 1 for 111 ms, then E. The start fails after 2.2 s (`Database "nodb" is unknown`, `++ cubrid heartbeat start: fail`, exit 1). After: E with `state unknown`, 0 |
+| 4a | `heartbeat start` with `ha_db_list` naming an unregistered database | 1 | after: yes / no | During: B, 1 for 111 ms, then E. The start fails after 2.2 s (`Database "nodb" is unknown`, `++ cubrid heartbeat start: fail`, exit 1). After: E with `state unknown`, 0 |
 | 4b | `heartbeat start` with the current host missing from `ha_node_list` (`cubrid@h-5:h-1`) | 2 + 1 for the streams | `cub_master` starts and exits about once a second / no | During the whole 180 s the start runs, every call printed **B, 1** or **C, 1** (C 13 and 14 times, each after 5.0 to 13.0 s); never E. The start then fails (`++ cubrid master start: fail`, exit 1); master log: `cannot find (h-0) in the ha_node_list.`. After: B, 1 |
-| 4c | POC-7 shape: a `heartbeat stop` and a second `heartbeat start` 4 s into a start | 1 | yes / gone | E throughout (`slave` → `unknown` → `slave` → `unknown`), 0. Both starts report `++ cubrid heartbeat start: fail`. After: E with `state unknown`, 0 |
-| 4d | POC-9 shape: `heartbeat start` right after `cubrid service stop` | 1 | old server still running | B, 1 at 147 and 159 ms, then E. This start succeeded; the failure POC-9 saw was not reproduced |
+| 4c | POC-7 shape: a `heartbeat stop` and a second `heartbeat start` 4 s into a start | 1 | after: yes / no | E throughout (`slave` → `unknown` → `slave` → `unknown`), 0. Both starts report `++ cubrid heartbeat start: fail`. After: E with `state unknown`, 0 |
+| 4d | POC-9 shape: `heartbeat start` right after `cubrid service stop`, so the stop (counted in 5b) and the start overlap | 1 | old server still running | B, 1 at 147 and 159 ms, then E. This start succeeded; the failure POC-9 saw was not reproduced |
 | 5a | During `cubrid heartbeat stop` (master and slave) | 4 | yes / exits after 0.3 to 0.5 s | E throughout, 0: the current node stays `master` or `slave` until about 1.1 s, then `unknown`. The command returns after 2.0 s |
-| 5b | During `cubrid service stop` (it runs `cubrid master stop`) with HA running; includes the stop of 4d | 6 | `cub_master` is gone 27 to 137 ms in; `cub_server` exits 63 to 186 ms in, `copylogdb`/`applylogdb` (`cub_admin`) and `cub_pl` about 1 s in | **B, 1** from the moment `cub_master` is gone, while the server, copylogdb, applylogdb and `cub_pl` still run; in 2 of 6 runs one D call just before (134 and 137 ms) |
+| 5b | During `cubrid service stop` (it prints `@ cubrid master stop`) with HA running; includes the stop of 4d | 6 | First call without `cub_master` / first call without `cub_server`, per run: 137/174, 46/71, 38/63, 27/64, 27/65, 134/186 ms, a gap of 37, 25, 25, 37, 38 and 52 ms. `copylogdb`/`applylogdb` (`cub_admin`) and `cub_pl` exit about 1 s in | **B, 1** from the moment `cub_master` is gone, while the server, copylogdb, applylogdb and `cub_pl` still run; in 2 of 6 runs one D call just before (134 and 137 ms) |
 | 5c | During `cubrid service stop` after `heartbeat stop` (master and slave) | 4 | `cub_master` exits / no | E with `state unknown` until `cub_master` exits; once C (13 ms); then B, 1 |
-| 6 | Status from a new `docker exec` (a new process and shell) while HA runs, master and slave | 9 + every polled call | yes / yes | E, 0, 22 to 25 ms |
+| 6 | Approximated: status from a new `docker exec` (a new process and shell) stood in for a restarted Instance Manager, while HA runs, master and slave | 9 + every polled call | yes / yes | E, 0, 22 to 25 ms |
 
 `cubrid master stop` is not a utility in this build (`'master' utility-name is
 invalid.`, exit 1); `cubrid service stop` prints `@ cubrid master stop` and
@@ -1584,6 +1587,11 @@ note was added to both.
 (`internal/instancemanager/cli.go`) sets `startable` when status exited by
 itself, with its output read, and the output has neither an `HA-Node Info`
 line nor a node line, whatever the exit code. Shapes B and C both qualify.
+One qualifier for C: when the caller set no context deadline, `ExecCLI`
+(`cli.go`, lines 49 to 52) ends the command after 10 s by default, so a C call
+that takes longer is classed as "did not answer" and is not startable. The HA
+bootstrap runs under its own deadline (`habootstrap.go`, line 148), so there
+the default does not apply.
 
 - **Agrees:** 1a and 1b (nothing running) give B, so a start would be issued;
   2c, 2d, 2e, 3' and 6 (heartbeat active) give E, so nothing would be started.
@@ -1593,16 +1601,19 @@ line nor a node line, whatever the exit code. Shapes B and C both qualify.
   start that cannot bring `cub_master` up, status prints B or C and exits 1. A
   second start issued in that time is what POC-3 and POC-7 warn against.
 - **Disagrees — a stop in progress looks inactive (5b):** once `cub_master` has
-  exited, status prints B and exits 1 although `cub_server` (for up to about
-  50 ms more) and `copylogdb`, `applylogdb` and `cub_pl` (for about 1 s) still
+  exited, status prints B and exits 1 although `cub_server` (for another 25 to
+  52 ms per run) and `copylogdb`, `applylogdb` and `cub_pl` (for about 1 s) still
   run. A start
   issued then races the old processes, the shape in which POC-9 saw
   `heartbeat start: fail` (not reproduced in the one run of 4d).
 - **Inactive but reported as running (2a, 4a, 4c):** after `heartbeat stop` or
   a failed start, `cub_master` stays and status prints E with
-  `state unknown`. Nothing is started on it; heartbeat comes back only after
-  `cub_master` stops (`cubrid service stop`). In 2c (`heartbeat stop appdb`)
-  a `heartbeat start` with `cub_master` still running succeeded (3').
+  `state unknown`, so the Instance Manager starts nothing on it. In 4c the
+  second start, issued while `cub_master` stayed, failed; POC-7 saw the same
+  and recovered only after `cub_master` was stopped. A plain
+  `heartbeat start` after 2a alone was not tried. In 2c
+  (`heartbeat stop appdb`) a `heartbeat start` with `cub_master` still running
+  succeeded (3').
 - `cub_master` alone proves nothing either way: it runs in 2a and 4a with HA
   not active, runs as `master` with no server in 2c and 2d, and is gone in 5b
   while HA processes still run.

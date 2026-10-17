@@ -93,9 +93,10 @@ state otherwise (a transition such as `to-be-master`, or `unknown` after a
 failed start). A status that did not answer (a timeout, a cancellation, a
 signal, a command that could not be run, or output that could not be read)
 fails the bootstrap without a start. A failed bootstrap is asked again
-within the operator's attempt limit (#274). That a status without HA node
-information means inactive heartbeat is an assumption: that output is not
-recorded on the engine (#345). Ordinal 0 is
+within the operator's attempt limit (#274). A status without HA node
+information is recorded on the engine for a member where nothing runs
+(docs/poc/RESULTS.md, POC-26); a start or a stop under way also prints it
+(#452). Ordinal 0 is
 only where the database is created; which member is master afterwards is
 CUBRID's decision. A standalone member's entrypoint runs `createdb` itself,
 inside the ownership marker described below with a value that is not an
