@@ -185,7 +185,9 @@ the implementation.
   tracking issue to finish. Keep GitHub Assignees current and record the next handoff on the issue.
 - Runs using all three lab VMs happen one at a time. Reserve the run with the
   other maintainer, record the candidate/environment and leave the lab in a
-  known state. Outside contributors do not receive lab credentials.
+  known state. Outside contributors do not receive lab credentials. How a
+  maintainer reaches the lab is in
+  [Reaching the multi-VM lab](./docs/testing/lab-access.md).
 
 ## Pull requests
 
