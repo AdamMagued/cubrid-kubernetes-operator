@@ -203,6 +203,33 @@ func TestObserveStartable_CubAdminAloneIsNoVeto(t *testing.T) {
 	}
 }
 
+// Process names match exactly: a process whose name only begins with one of
+// the vetoed names is no veto.
+func TestObserveStartable_MatchesProcessNamesExactly(t *testing.T) {
+	cli := &sequenceCLI{t: t, answers: []statusAnswer{answerB}}
+	if hb := guardedServer(cli, processTable([]string{procServer + "_xyz"}), time.Millisecond).observeStartable(t.Context()); !hb.startable {
+		t.Errorf("startable = false (%s) with %s_xyz alone", hb.reason, procServer)
+	}
+}
+
+// A second round that finds heartbeat running with a confirmed role follows
+// the rule for running heartbeat: the bootstrap completes without a start.
+func TestHABootstrap_SecondRoundWithARoleCompletesWithoutAStart(t *testing.T) {
+	f := newHAFixture(t)
+	cli := &sequenceCLI{t: t, answers: []statusAnswer{answerB, {masterOut, false}}}
+	f.srv.cli = cli
+	final := f.run("boot-1")
+	if final.State != OpCompleted {
+		t.Fatalf("final = %s (%s), want Completed", final.State, final.FailureReason)
+	}
+	cli.mu.Lock()
+	calls := append([]string(nil), cli.calls...)
+	cli.mu.Unlock()
+	if count(calls, callHeartbeatStart) != 0 || len(cli.statusCalls()) != 2 {
+		t.Errorf("calls = %q, want two statuses and no heartbeat start", calls)
+	}
+}
+
 // The HA bootstrap issues no heartbeat start while cub_master runs.
 func TestHABootstrap_DoesNotStartHeartbeatWhileCUBRIDRuns(t *testing.T) {
 	f := newHAFixture(t)
@@ -245,8 +272,9 @@ func TestHABootstrap_StopDuringTheSettleIntervalStartsNothing(t *testing.T) {
 		t.Fatalf("/v1/ha/bootstrap = %d: %s", rr.Code, rr.Body.String())
 	}
 	final := pollUntilTerminal(t, f.handler, op.ID)
-	if final.State != OpFailed || !strings.Contains(final.FailureReason, errStopping.Error()) {
-		t.Fatalf("final = %s (%s), want Failed because the member is stopping", final.State, final.FailureReason)
+	if final.State != OpFailed || !strings.Contains(final.FailureReason, errStopping.Error()) ||
+		!strings.Contains(final.FailureReason, "the wait between two heartbeat status calls ended") {
+		t.Fatalf("final = %s (%s), want Failed because the member is stopping, naming the wait", final.State, final.FailureReason)
 	}
 	if calls := f.cli.recorded(); count(calls, callHeartbeatStart) != 0 {
 		t.Errorf("heartbeat was started after the stop: %q", calls)

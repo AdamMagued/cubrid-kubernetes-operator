@@ -709,9 +709,11 @@ func (s *Server) runRestore(id string, req RestoreRequest) {
 // stopped: in a recovery bootstrap it started nothing and runs only once, and
 // it starts no database that carries an ownership marker. A standalone
 // member's server is started; a configured HA member joins HA, with
-// `cubrid heartbeat start` issued only when heartbeat status exited by itself
-// without HA node information (observeHeartbeat); a status that did not
-// answer starts nothing and is an error. before runs ahead of
+// `cubrid heartbeat start` issued only when observeStartable allows it: two
+// rounds, heartbeatSettle apart, of a heartbeat status that exited by itself
+// without HA node information and a process table without any of
+// heartbeatVeto. A round that did not answer, or that sees such a process,
+// starts nothing and is an error. before runs ahead of
 // each start command, and an error from it stops before that command; nil
 // runs nothing.
 func (s *Server) startRestoredDatabase(ctx context.Context, database string, haMember bool, before func() error) error {

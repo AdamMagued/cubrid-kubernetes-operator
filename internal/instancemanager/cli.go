@@ -151,9 +151,10 @@ func observeHeartbeat(ctx context.Context, cli CLI) heartbeatObservation {
 }
 
 // heartbeatSettle is the default time between the two observations a
-// heartbeat start needs. In POC-26 status printed no HA node information for
-// at most 141 ms of a start from nothing, and the processes of a stop ran for
-// about 1 s after it did; 2 s is above both, on one local host without load.
+// heartbeat start needs. In POC-26 status printed no HA node information up
+// to 159 ms into a start (state 4d, a start right after a service stop), and
+// the processes of a stop ran for about 1 s after it did; 2 s is above both,
+// on one local host without load.
 const heartbeatSettle = 2 * time.Second
 
 // heartbeatVeto are the processes that forbid a heartbeat start while status
@@ -162,7 +163,11 @@ const heartbeatSettle = 2 * time.Second
 // after cub_master during a service stop, cub_pl for about 1 s, as long as
 // copylogdb and applylogdb. Those two run as cub_admin, which is no veto: the
 // manager's own utilities, such as applyinfo for /v1/ha/convergence, may run
-// under that name too, and would fail operations for nothing.
+// under that name too, and would fail operations for nothing. Nor does the
+// manager's own createdb or restoredb leave a veto behind: on cubrid/cubrid:11.4
+// (local Docker, one standalone container, a few runs) /proc showed no cub*
+// process when sampled every 100 ms for 1 s after createdb and 0.6 s after
+// each of 3 restoredb -u runs exited 0. Names match exactly.
 var heartbeatVeto = []string{"cub_master", "cub_server", "cub_pl"}
 
 // observeStartable decides whether `cubrid heartbeat start` may be issued
@@ -171,9 +176,12 @@ var heartbeatVeto = []string{"cub_master", "cub_server", "cub_pl"}
 // heartbeatVeto running: one answer cannot tell a member whose heartbeat was
 // never started from one whose start or stop is under way (POC-26). A process
 // table that cannot be read starts nothing, and the wait ends with ctx, so a
-// stop ends it. Known limit: a start issued outside the manager while
+// stop ends it. Known limits: a start issued outside the manager while
 // cub_master comes and goes (POC-26 state 4b) passes when both process
-// snapshots miss it.
+// snapshots miss it, and a start or a stop from outside the manager that
+// begins after the second snapshot and before the start command is not seen
+// (check, then act). The shutdown fallback that runs in another process
+// before the manager listens is #323.
 func (s *Server) observeStartable(ctx context.Context) heartbeatObservation {
 	hb := s.observeQuiet(ctx)
 	if !hb.startable {
@@ -183,7 +191,7 @@ func (s *Server) observeStartable(ctx context.Context) heartbeatObservation {
 	defer settle.Stop()
 	select {
 	case <-ctx.Done():
-		return heartbeatObservation{reason: "heartbeat status did not answer: " + ctx.Err().Error()}
+		return heartbeatObservation{reason: "the wait between two heartbeat status calls ended: " + ctx.Err().Error()}
 	case <-settle.C:
 	}
 	return s.observeQuiet(ctx)
