@@ -43,6 +43,20 @@ jobs:
     env:
       REGISTRY: ghcr.io/cubrid-lab/cubrid-kubernetes-operator
     steps:
+      # Before anything is fetched: an input that is not exactly a full SHA
+      # fails here, whatever else it contains.
+      - name: Check the format of the requested commit
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+        run: |
+          if [ -z "$INPUT_SHA" ]; then
+            exit 0
+          fi
+          if [[ ! "$INPUT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::sha must be a full 40-character lowercase commit SHA"
+            exit 1
+          fi
+
       - name: Clone the code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -56,11 +70,11 @@ jobs:
         env:
           INPUT_SHA: ${{ inputs.sha }}
         run: |
-          if [ -n "$INPUT_SHA" ] && ! printf '%s' "$INPUT_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::error::sha must be a full 40-character lowercase commit SHA, got '$INPUT_SHA'"
+          sha=$(git rev-parse HEAD)
+          if [ -n "$INPUT_SHA" ] && [ "$sha" != "$INPUT_SHA" ]; then
+            echo "::error::Checked out $sha, not the requested commit $INPUT_SHA"
             exit 1
           fi
-          sha=$(git rev-parse HEAD)
           if ! git merge-base --is-ancestor "$sha" origin/main; then
             echo "::error::Commit $sha is not on main; development images are built only for main commits"
             exit 1
@@ -80,6 +94,22 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A tag is never overwritten. The lab records tags, and a rebuild on
+      # mutable base images would change the bytes under the same tag, so a
+      # re-run of a commit that already has images fails here. A tag that
+      # cannot be inspected (absent, or a package not created yet, which GHCR
+      # answers with an authorization error) is built.
+      - name: Refuse to overwrite an existing tag
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          for img in manager instance-manager; do
+            if docker buildx imagetools inspect "$REGISTRY/$img:$TAG" > /dev/null 2>&1; then
+              echo "::error::$REGISTRY/$img:$TAG already exists; development image tags are never overwritten"
+              exit 1
+            fi
+          done
 
       # Same Dockerfile, context and build arguments as `make docker-build`
       # (BASE_IMAGE left at its default). Provenance and SBOM attestations are
@@ -122,7 +152,9 @@ jobs:
           cache-from: type=gha,scope=instance-manager
           cache-to: type=gha,scope=instance-manager,mode=max
 
+      # Also after a failed step, so a partial run says what it left behind.
       - name: Write the digests to the job summary
+        if: always() && steps.meta.outputs.sha != ''
         env:
           SHA: ${{ steps.meta.outputs.sha }}
           TAG: ${{ steps.meta.outputs.tag }}
@@ -132,10 +164,10 @@ jobs:
           {
             echo "## Development images of $SHA"
             echo
-            echo "Not a release. linux/amd64 only."
+            echo "Not a release. linux/amd64 only. A commit has images only if this run succeeded."
             echo
             echo "| Image | Tag | Digest |"
             echo "|---|---|---|"
-            echo "| \`$REGISTRY/manager\` | \`$TAG\` | \`$MANAGER_DIGEST\` |"
-            echo "| \`$REGISTRY/instance-manager\` | \`$TAG\` | \`$IM_DIGEST\` |"
+            echo "| \`$REGISTRY/manager\` | \`$TAG\` | ${MANAGER_DIGEST:-(not pushed)} |"
+            echo "| \`$REGISTRY/instance-manager\` | \`$TAG\` | ${IM_DIGEST:-(not pushed)} |"
           } >> "$GITHUB_STEP_SUMMARY"
