@@ -655,16 +655,21 @@ it needs more.
 
 - **Level:** real database on Kind.
 - **Variants:** `graceful` (the Pod is deleted and its termination grace
-  period is respected) and `abrupt` (the container's processes are killed
-  without notice). On Kind the abrupt case runs twice: as
+  period is respected) and `abrupt` (the Pod is deleted without a grace
+  period; Kubernetes kills its containers about three seconds later). On Kind the abrupt case runs twice: as
   `abrupt-first-member` while the master is the first member of the node
   list, where CUBRID was observed to make the same member master again in
   most runs (POC-19), and as `abrupt` with whichever member is the master
   later in the run. All are reported separately.
 - **Fault confirmed by:** the Pod's UID or the container's restart count
   changed, and the former master stopped answering SQL. On Kind the `abrupt`
-  variant deletes the Pod without a grace period, so its containers are
-  killed without the preStop hook and without `SIGTERM`.
+  variant deletes the Pod without a grace period. That removes the Pod object
+  at once, but not its containers: in a probe on the pinned Kind the old
+  container still ran its preStop hook, got `SIGTERM` about one second after
+  the deletion and was killed about three seconds after it, and the
+  replacement's container could start before that (POC-28, part 1). The
+  probe's container ignored SIGTERM; a member's container stops CUBRID in
+  its preStop hook and on SIGTERM, so it can end earlier.
 - **CUBRID is expected to** (Manual; POC-3, POC-19): end with exactly one
   master. Normally a slave is promoted, and the former master does not become
   master again when it returns. When the master is the first member of the
@@ -689,6 +694,18 @@ it needs more.
 - **Data check:** all data rules on all three members after the former master
   has rejoined.
 - **Limits:** `failover_limit`, `rejoin_limit`, `stable_period`.
+- **Replication record:** after each abrupt variant, passed or failed,
+  `S03/<variant>/replication-state.txt` keeps the Events of the members'
+  Pods, old and new (the deleted Pod's `Killing`, the replacement's
+  `Created` and `Started`, by Pod UID), each Pod's UID and its containers'
+  start times, and from each member: `cubrid heartbeat status`; for each
+  other member `cubrid applyinfo` for the log copied from it and the last
+  messages of its `copylogdb` and `applylogdb` error logs with repeats
+  counted; the server error log's recovery, checkpoint, HA mode and volume
+  lock lines; and the active log's lock file. It is what #357 needs to tell
+  whether a returning master's server started while the deleted Pod's
+  container still ran, and whether the slaves' appliers stopped at an invalid
+  record (POC-28).
 
 ### S04: primary VM failure
 
