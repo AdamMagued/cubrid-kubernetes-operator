@@ -17,6 +17,7 @@ limitations under the License.
 package instancemanager
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -52,6 +53,9 @@ type OperationStore struct {
 	mu  sync.Mutex
 	// logger records state changes; nil records nothing.
 	logger *slog.Logger
+	// unsettled holds, by operation ID, the end of an operation that could
+	// not be written (Settle).
+	unsettled map[string]func(*Operation)
 }
 
 // SetLogger makes the store log every operation it creates and every change
@@ -109,6 +113,12 @@ func (s *OperationStore) FindOrCreate(kind OperationKind, idempotencyKey, reques
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// An end that could not be written is tried again first. While it stays
+	// unwritten its operation counts as running, so nothing is started
+	// beside it.
+	for id := range s.unsettled {
+		_ = s.settleLocked(id, true)
+	}
 	ops, err := s.listLocked()
 	if err != nil {
 		return nil, false, err
@@ -118,6 +128,10 @@ func (s *OperationStore) FindOrCreate(kind OperationKind, idempotencyKey, reques
 		if op.IdempotencyKey == idempotencyKey && op.Kind == kind {
 			if op.RequestHash != requestHash {
 				return nil, false, ErrIdempotencyConflict
+			}
+			// The record still says that the operation runs.
+			if _, unwritten := s.unsettled[op.ID]; unwritten {
+				return nil, false, errUnwrittenEnd(op.ID, nil)
 			}
 			return op, true, nil
 		}
@@ -146,6 +160,7 @@ func (s *OperationStore) FindOrCreate(kind OperationKind, idempotencyKey, reques
 		UpdatedAt:      now,
 	}
 	if err := s.writeLocked(op); err != nil {
+		s.logWriteFailure(op, err, slog.LevelError)
 		return nil, false, err
 	}
 	s.logState(op, "")
@@ -155,10 +170,15 @@ func (s *OperationStore) FindOrCreate(kind OperationKind, idempotencyKey, reques
 // FindByKey returns the operations recorded under idempotencyKey, of any
 // kind. It only reads the store. Unlike listLocked it fails on a record it
 // cannot read: that record may be the one asked for, so "none" would not be
-// known.
+// known. An end that could not be written (Settle) is tried again first; while
+// one of the operations asked for stays unwritten FindByKey fails, as Get
+// does, rather than return a record that still says the operation runs.
 func (s *OperationStore) FindByKey(idempotencyKey string) ([]*Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for id := range s.unsettled {
+		_ = s.settleLocked(id, true)
+	}
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		return nil, fmt.Errorf("read operation store: %w", err)
@@ -177,26 +197,40 @@ func (s *OperationStore) FindByKey(idempotencyKey string) ([]*Operation, error) 
 			return nil, err
 		}
 		if op.IdempotencyKey == idempotencyKey {
+			if _, unwritten := s.unsettled[op.ID]; unwritten {
+				return nil, errUnwrittenEnd(op.ID, nil)
+			}
 			found = append(found, op)
 		}
 	}
 	return found, nil
 }
 
-// Get returns the operation with the given ID.
+// Get returns the operation with the given ID. An operation whose end could
+// not be written (Settle) is written first; while that fails Get returns the
+// error and not the record, which still says that the operation runs.
 func (s *OperationStore) Get(id string) (*Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !isValidOperationID(id) {
 		return nil, ErrOperationNotFound
 	}
+	if err := s.settleLocked(id, true); err != nil {
+		return nil, errUnwrittenEnd(id, err)
+	}
 	return s.readLocked(id)
 }
 
 // Update applies mutate to the stored operation and persists it atomically.
+// A record that could not be written is logged as an error.
 func (s *OperationStore) Update(id string, mutate func(*Operation)) (*Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.updateLocked(id, mutate, slog.LevelError)
+}
+
+// updateLocked is Update under s.mu. A write that fails is logged at level.
+func (s *OperationStore) updateLocked(id string, mutate func(*Operation), level slog.Level) (*Operation, error) {
 	op, err := s.readLocked(id)
 	if err != nil {
 		return nil, err
@@ -205,12 +239,68 @@ func (s *OperationStore) Update(id string, mutate func(*Operation)) (*Operation,
 	mutate(op)
 	op.UpdatedAt = time.Now().UTC()
 	if err := s.writeLocked(op); err != nil {
+		s.logWriteFailure(op, err, level)
 		return nil, err
 	}
 	if op.State != previous {
 		s.logState(op, previous)
 	}
 	return op, nil
+}
+
+// Settle records how an operation ended. When the record cannot be written,
+// the end is kept in memory and written by the next Get of the operation, the
+// next FindByKey or the next FindOrCreate; it is never reported as recorded
+// before it is, and until then those three answer an error for it rather
+// than the record, which still says that the operation runs. The first
+// failed write is logged as an error, the retries at debug level. A
+// manager that restarts meanwhile finds the operation unfinished and fails
+// it (reconcileOnStart): an end that was only in memory does not count.
+func (s *OperationStore) Settle(id string, mutate func(*Operation)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.unsettled == nil {
+		s.unsettled = map[string]func(*Operation){}
+	}
+	s.unsettled[id] = mutate
+	return s.settleLocked(id, false)
+}
+
+// settleLocked writes the kept end of operation id, if there is one. A retry
+// that fails is logged at debug level: the first failure was an error.
+func (s *OperationStore) settleLocked(id string, retry bool) error {
+	mutate, ok := s.unsettled[id]
+	if !ok {
+		return nil
+	}
+	level := slog.LevelError
+	if retry {
+		level = slog.LevelDebug
+	}
+	_, err := s.updateLocked(id, mutate, level)
+	if err == nil || errors.Is(err, ErrOperationNotFound) {
+		delete(s.unsettled, id)
+	}
+	return err
+}
+
+// errUnwrittenEnd is the error for operation id while its end is kept in
+// memory only (Settle); cause is the failed write, when there is one.
+func errUnwrittenEnd(id string, cause error) error {
+	if cause == nil {
+		return fmt.Errorf("operation %s has ended, and how it ended could not be recorded yet", id)
+	}
+	return fmt.Errorf("operation %s has ended, and how it ended could not be recorded yet: %w", id, cause)
+}
+
+// logWriteFailure records at level that an operation's record could not be
+// written, with the state that is therefore not on disk.
+func (s *OperationStore) logWriteFailure(op *Operation, err error, level slog.Level) {
+	if s.logger == nil {
+		return
+	}
+	s.logger.Log(context.Background(), level, "Could not write the operation record", "event", eventStoreWriteFailed,
+		"operationID", op.ID, "kind", string(op.Kind), "state", string(op.State), "err", err.Error())
 }
 
 func (s *OperationStore) reconcileOnStart() error {
