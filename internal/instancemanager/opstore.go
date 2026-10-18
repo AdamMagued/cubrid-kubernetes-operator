@@ -24,9 +24,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 )
@@ -44,6 +47,13 @@ var ErrOperationInProgress = errors.New("a mutating operation is already in prog
 // ErrOperationNotFound is returned when an operation ID does not exist.
 var ErrOperationNotFound = errors.New("operation not found")
 
+// ErrOperationRecordUnreadable is returned when a new operation is asked for
+// while the store holds a record it cannot read or decode. A record is named
+// by its random operation ID; the idempotency key, kind and database are only
+// inside it. It may therefore be the operation the request names, or one that
+// holds the database, and no operation is started beside it (#427).
+var ErrOperationRecordUnreadable = errors.New("an operation record cannot be read")
+
 // OperationStore persists Operation records to the PVC so a manager or operator
 // restart can re-poll by ID / idempotency key and reconstruct state from durable
 // facts (ADR-0003). All mutations are serialized and written atomically
@@ -56,14 +66,30 @@ type OperationStore struct {
 	// unsettled holds, by operation ID, the end of an operation that could
 	// not be written (Settle).
 	unsettled map[string]func(*Operation)
+	// unreadable holds, by operation ID, the records the latest listing
+	// could not read.
+	unreadable map[string]*unreadableRecord
+	// interrupted holds the IDs of the records reconcileOnStart could not
+	// read. The first successful read of one that has not ended fails it,
+	// as reconcileOnStart would have.
+	interrupted map[string]bool
+}
+
+// unreadableRecord is a record that could not be read, why, and whether
+// that has been logged.
+type unreadableRecord struct {
+	err    error
+	logged bool
 }
 
 // SetLogger makes the store log every operation it creates and every change
-// of an operation's state.
+// of an operation's state. A record found unreadable before, as at start, is
+// logged now.
 func (s *OperationStore) SetLogger(logger *slog.Logger) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.logger = logger
+	s.logUnreadableLocked()
 }
 
 // logState records one change of an operation's state. A failure is a
@@ -108,7 +134,12 @@ func HashRequest(body []byte) string {
 //   - existing op, same request  -> (op, existed=true, nil)
 //   - existing op, diff request  -> ErrIdempotencyConflict
 //   - a different in-flight op on the same database -> ErrOperationInProgress
+//   - a record that cannot be read -> ErrOperationRecordUnreadable
 //   - none                       -> (newly created Pending op, existed=false, nil)
+//
+// A record that cannot be read may hold the key or the database, so while
+// one exists no operation is created, of any key, kind or database. A
+// readable record under the key is still answered: that starts nothing.
 func (s *OperationStore) FindOrCreate(kind OperationKind, idempotencyKey, requestHash, database string) (*Operation, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -135,6 +166,11 @@ func (s *OperationStore) FindOrCreate(kind OperationKind, idempotencyKey, reques
 			}
 			return op, true, nil
 		}
+	}
+
+	// No readable record under the key: one that cannot be read may be it.
+	if err := s.unreadableErrLocked(); err != nil {
+		return nil, false, err
 	}
 
 	// No matching key: refuse if another non-terminal op holds this database.
@@ -303,6 +339,15 @@ func (s *OperationStore) logWriteFailure(op *Operation, err error, level slog.Le
 		"operationID", op.ID, "kind", string(op.Kind), "state", string(op.State), "err", err.Error())
 }
 
+// reasonRestarted is the failure reason of an operation that was running
+// when the manager stopped.
+const reasonRestarted = "manager restarted while operation was in progress"
+
+// reconcileOnStart fails every readable record that has not ended. A record
+// it cannot read is left as it is: it may be an operation that was running,
+// and it cannot be failed now, so FindOrCreate admits nothing while it stays
+// unreadable, and SetLogger logs it. It is remembered, and failed at its
+// first successful read if it has not ended (readLocked).
 func (s *OperationStore) reconcileOnStart() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -310,12 +355,18 @@ func (s *OperationStore) reconcileOnStart() error {
 	if err != nil {
 		return err
 	}
+	for id := range s.unreadable {
+		if s.interrupted == nil {
+			s.interrupted = map[string]bool{}
+		}
+		s.interrupted[id] = true
+	}
 	for _, op := range ops {
 		if op.State.IsTerminal() {
 			continue
 		}
 		op.State = OpFailed
-		op.FailureReason = "manager restarted while operation was in progress"
+		op.FailureReason = reasonRestarted
 		op.UpdatedAt = time.Now().UTC()
 		if err := s.writeLocked(op); err != nil {
 			return err
@@ -324,24 +375,70 @@ func (s *OperationStore) reconcileOnStart() error {
 	return nil
 }
 
+// listLocked returns the records it can read. Those it cannot read are kept
+// in s.unreadable, replacing the previous listing's, and each is logged once
+// while it stays unreadable.
 func (s *OperationStore) listLocked() ([]*Operation, error) {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		return nil, fmt.Errorf("read operation store: %w", err)
 	}
 	ops := make([]*Operation, 0, len(entries))
+	unreadable := map[string]*unreadableRecord{}
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || filepath.Ext(name) != ".json" {
 			continue
 		}
-		op, err := s.readLocked(name[:len(name)-len(".json")])
+		id := name[:len(name)-len(".json")]
+		op, err := s.readLocked(id)
+		if errors.Is(err, ErrOperationNotFound) {
+			continue
+		}
 		if err != nil {
+			rec := &unreadableRecord{err: err}
+			if known, ok := s.unreadable[id]; ok {
+				rec.logged = known.logged
+			}
+			unreadable[id] = rec
 			continue
 		}
 		ops = append(ops, op)
 	}
+	s.unreadable = unreadable
+	s.logUnreadableLocked()
 	return ops, nil
+}
+
+// logUnreadableLocked logs each unreadable record that has not been logged.
+func (s *OperationStore) logUnreadableLocked() {
+	if s.logger == nil {
+		return
+	}
+	for _, id := range slices.Sorted(maps.Keys(s.unreadable)) {
+		rec := s.unreadable[id]
+		if rec.logged {
+			continue
+		}
+		s.logger.Error("Could not read the operation record", "event", eventRecordUnreadable,
+			"operationID", id, "err", rec.err.Error())
+		rec.logged = true
+	}
+}
+
+// unreadableErrLocked is ErrOperationRecordUnreadable for the records the
+// latest listing could not read, or nil when there are none.
+func (s *OperationStore) unreadableErrLocked() error {
+	if len(s.unreadable) == 0 {
+		return nil
+	}
+	ids := slices.Sorted(maps.Keys(s.unreadable))
+	more := ""
+	if len(ids) > 1 {
+		more = fmt.Sprintf(" (and %d more)", len(ids)-1)
+	}
+	return fmt.Errorf("%w%s: %w; no operation is started while it may be the one asked for or one that holds the database",
+		ErrOperationRecordUnreadable, more, s.unreadable[ids[0]].err)
 }
 
 func (s *OperationStore) readLocked(id string) (*Operation, error) {
@@ -353,13 +450,48 @@ func (s *OperationStore) readLocked(id string) (*Operation, error) {
 		if os.IsNotExist(err) {
 			return nil, ErrOperationNotFound
 		}
+		// The error names the operation; the path is the store's.
+		if pathErr, ok := errors.AsType[*fs.PathError](err); ok {
+			err = pathErr.Err
+		}
 		return nil, fmt.Errorf("read operation %s: %w", id, err)
 	}
 	var op Operation
 	if err := json.Unmarshal(data, &op); err != nil {
 		return nil, fmt.Errorf("decode operation %s: %w", id, err)
 	}
+	// A record that is not this operation's, or lacks what admission
+	// matches on, is no more usable than one that does not decode.
+	if op.ID != id || op.Kind == "" || op.IdempotencyKey == "" {
+		return nil, fmt.Errorf("decode operation %s: the record has ID %q, kind %q and an idempotency key of %d bytes",
+			id, op.ID, op.Kind, len(op.IdempotencyKey))
+	}
+	if s.interrupted[id] {
+		if err := s.failInterruptedLocked(&op); err != nil {
+			return nil, err
+		}
+	}
 	return &op, nil
+}
+
+// failInterruptedLocked fails op, a record reconcileOnStart could not read,
+// at its first successful read if it has not ended, as reconcileOnStart
+// would have. A failure that cannot be written leaves it remembered and is
+// returned, so the record is not answered as running.
+func (s *OperationStore) failInterruptedLocked(op *Operation) error {
+	if !op.State.IsTerminal() {
+		previous := op.State
+		op.State = OpFailed
+		op.FailureReason = reasonRestarted
+		op.UpdatedAt = time.Now().UTC()
+		if err := s.writeLocked(op); err != nil {
+			s.logWriteFailure(op, err, slog.LevelError)
+			return fmt.Errorf("record that operation %s was interrupted by a restart: %w", op.ID, err)
+		}
+		s.logState(op, previous)
+	}
+	delete(s.interrupted, op.ID)
+	return nil
 }
 
 // writeLocked persists op atomically: write a temp file then rename over the
