@@ -26,7 +26,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -37,9 +39,24 @@ import (
 // and keeps the lock until its standard input is closed.
 const envHoldLock = "IM_TEST_HOLD_POSIX_LOCK"
 
+// envTakeMemberLock makes the test binary take the member lock on its file
+// descriptor 3, as "instance-manager wait-volume-free" does on the
+// descriptor the entrypoint passes it, say "locked" and exit.
+const envTakeMemberLock = "IM_TEST_TAKE_MEMBER_LOCK"
+
 func TestMain(m *testing.M) {
 	if path := os.Getenv(envHoldLock); path != "" {
 		os.Exit(holdLock(path))
+	}
+	if path := os.Getenv(envTakeMemberLock); path != "" {
+		err := AcquireMemberLock(context.Background(), os.NewFile(3, "member lock"), path,
+			slog.New(slog.NewTextHandler(io.Discard, nil)), 10*time.Millisecond, time.Hour)
+		if err != nil {
+			_, _ = os.Stdout.WriteString(err.Error() + "\n")
+			os.Exit(4)
+		}
+		_, _ = os.Stdout.WriteString("locked\n")
+		os.Exit(0)
 	}
 	os.Exit(m.Run())
 }
@@ -312,4 +329,225 @@ func TestWaitVolumeFree_AFailedCheckWaits(t *testing.T) {
 	if !strings.Contains(logs.String(), `"event":"volume_check_failed"`) {
 		t.Errorf("want a volume_check_failed line:\n%s", logs.String())
 	}
+}
+
+// openMemberLock creates the member lock file below databases and opens it
+// as the entrypoint does (read and write), as a description of its own each
+// time it is called.
+func openMemberLock(t *testing.T, databases string) (*os.File, string) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("open file description locks are Linux's")
+	}
+	path := filepath.Join(databases, MemberLockFile)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600) // #nosec G304 -- a test directory
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	return f, path
+}
+
+// takeMemberLockInChild has another process take the member lock on f,
+// passed as its descriptor 3, and returns once that process has exited.
+func takeMemberLockInChild(t *testing.T, f *os.File, path string) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(), envTakeMemberLock+"="+path)
+	cmd.ExtraFiles = []*os.File{f}
+	out, err := cmd.CombinedOutput()
+	if err != nil || string(out) != "locked\n" {
+		t.Fatalf("the child did not take the member lock: %q, %v", out, err)
+	}
+}
+
+func memberLockHeld(t *testing.T, path string) bool {
+	t.Helper()
+	held, _, err := probeLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return held
+}
+
+// The entrypoint opens the member lock file and keeps it open; the manager
+// it starts takes the lock on that descriptor and exits. The lock stays held
+// after the process that took it is gone, for as long as the descriptor is
+// open, and is released when the last one closes. A POSIX lock would be gone
+// with the process that took it (#475).
+func TestAcquireMemberLock_HeldAfterTheTakerExitsUntilTheLastDescriptorCloses(t *testing.T) {
+	f, path := openMemberLock(t, t.TempDir())
+	takeMemberLockInChild(t, f, path)
+	if !memberLockHeld(t, path) {
+		t.Fatal("the member lock was released when the process that took it exited, while the descriptor was still open")
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if memberLockHeld(t, path) {
+		t.Fatal("the member lock is still held after the last descriptor was closed")
+	}
+}
+
+// A second container of the member waits while the first holds the member
+// lock, says so, takes nothing from it, and takes the lock once the first is
+// gone.
+func TestAcquireMemberLock_WaitsWhileAnotherContainerHoldsIt(t *testing.T) {
+	databases := t.TempDir()
+	first, path := openMemberLock(t, databases)
+	takeMemberLockInChild(t, first, path)
+	second, _ := openMemberLock(t, databases)
+
+	var logs bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- AcquireMemberLock(context.Background(), second, path, jsonLogger(&logs), 10*time.Millisecond, time.Hour)
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("took the member lock while another container held it: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if !memberLockHeld(t, path) {
+		t.Fatal("the first holder's lock is gone while it still holds the descriptor")
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the member lock was not taken after the other holder was gone")
+	}
+	if !memberLockHeld(t, path) {
+		t.Error("the member lock is not held after AcquireMemberLock returned")
+	}
+	out := logs.String()
+	if strings.Count(out, `"event":"member_lock_busy"`) != 1 || !strings.Contains(out, `"file":"`+path+`"`) {
+		t.Errorf("want one member_lock_busy line naming %s (logEvery is an hour):\n%s", path, out)
+	}
+	if !strings.Contains(out, `"event":"member_lock_acquired"`) {
+		t.Errorf("want a member_lock_acquired line:\n%s", out)
+	}
+}
+
+// A termination ends the wait with an error, and the lock was not taken.
+func TestAcquireMemberLock_EndsWithTheContextWhileHeld(t *testing.T) {
+	databases := t.TempDir()
+	first, path := openMemberLock(t, databases)
+	takeMemberLockInChild(t, first, path)
+	second, _ := openMemberLock(t, databases)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	var logs bytes.Buffer
+	err := AcquireMemberLock(ctx, second, path, jsonLogger(&logs), 10*time.Millisecond, time.Hour)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want the context's", err)
+	}
+	if strings.Contains(logs.String(), "member_lock_acquired") {
+		t.Errorf("logged the lock as taken:\n%s", logs.String())
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if memberLockHeld(t, path) {
+		t.Error("the member lock is held by the description whose wait was ended")
+	}
+}
+
+// A descriptor that is not the member lock file, or none at all, is refused
+// and locks nothing: the entrypoint would not hold the lock it relies on.
+func TestAcquireMemberLock_RefusesADescriptorThatIsNotTheLockFile(t *testing.T) {
+	databases := t.TempDir()
+	_, path := openMemberLock(t, databases)
+	other, err := os.Create(filepath.Join(databases, "other"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = other.Close() }()
+	closed, err := os.Open(path) // #nosec G304 -- a test directory
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = closed.Close()
+	readOnly, err := os.Open(path) // #nosec G304 -- a test directory
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = readOnly.Close() }()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for name, f := range map[string]*os.File{
+		"another file": other, "a closed descriptor": closed, "a read-only descriptor": readOnly,
+	} {
+		if err := AcquireMemberLock(context.Background(), f, path, logger, 10*time.Millisecond, time.Hour); err == nil {
+			t.Errorf("%s: err = nil, want a refusal", name)
+		}
+	}
+	if err := AcquireMemberLock(context.Background(), other, filepath.Join(databases, "missing"), logger,
+		10*time.Millisecond, time.Hour); err == nil {
+		t.Error("a missing lock file: err = nil, want a refusal")
+	}
+	if memberLockHeld(t, path) {
+		t.Error("the member lock was taken through a descriptor that is not its file")
+	}
+}
+
+// A lock file that is removed while the wait goes on is not taken for the
+// lock: no other container opens the old file any more.
+func TestAcquireMemberLock_RefusesALockFileRemovedWhileWaiting(t *testing.T) {
+	databases := t.TempDir()
+	first, path := openMemberLock(t, databases)
+	takeMemberLockInChild(t, first, path)
+	second, _ := openMemberLock(t, databases)
+	busy := &eventWriter{event: `"event":"member_lock_busy"`, seen: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		done <- AcquireMemberLock(context.Background(), second, path,
+			slog.New(slog.NewJSONHandler(busy, nil)), 10*time.Millisecond, time.Hour)
+	}()
+	// The file is removed only once the wait is under way, so the check
+	// after the lock is taken is what refuses it.
+	select {
+	case <-busy.seen:
+	case err := <-done:
+		t.Fatalf("AcquireMemberLock returned before it waited: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("no member_lock_busy line while another container held the lock")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "replaced or removed") {
+			t.Fatalf("err = %v after the lock file was removed, want the refusal of a replaced or removed file", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("AcquireMemberLock did not return after the old file was released")
+	}
+}
+
+// eventWriter is a log destination that closes seen at the first line
+// holding event; it is written from another goroutine.
+type eventWriter struct {
+	mu    sync.Mutex
+	event string
+	seen  chan struct{}
+	done  bool
+}
+
+func (w *eventWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.done && strings.Contains(string(p), w.event) {
+		w.done = true
+		close(w.seen)
+	}
+	return len(p), nil
 }

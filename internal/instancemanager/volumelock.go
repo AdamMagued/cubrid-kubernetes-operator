@@ -193,6 +193,11 @@ func probeLock(path string) (bool, int32, error) {
 	return lock.Type != syscall.F_UNLCK, lock.Pid, nil
 }
 
+// MemberLockFile is the file directly below CUBRID_DATABASES that a member's
+// container holds an exclusive lock on for its whole life (#475). Nothing
+// removes it.
+const MemberLockFile = ".member-lock"
+
 // WaitVolumeFree returns once no other process holds a CUBRID lock on the
 // database directories under databases (HeldVolumeLocks): a server, log
 // copier or log applier of an earlier container of this member that still
