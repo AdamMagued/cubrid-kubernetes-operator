@@ -116,7 +116,8 @@ the restored data and its ownership marker are kept (#454).
 Known limit: an attempt that is cut off while its `cubrid heartbeat start`
 still runs (a manager restart, a timeout) leaves heartbeat activating, and the
 next attempt can see a `to-be-*` or `unknown` state, fail on it and use up an
-attempt; on the seeding path each such retry also takes a new seed backup.
+attempt. On the seeding path such a retry takes over the data the earlier
+attempt restored and takes no new seed backup (ADR-0008, #463).
 Whether this exhausts the attempt limit in practice is not shown, and no
 extra retry is made for it.
 Known limit: a start issued outside the Instance Manager while `cub_master`
@@ -207,7 +208,14 @@ which is not detected and has not been tried on the engine; and a copy that
 failed after it had restored the data, when the master has changed since: the
 next attempt copies from the new master, the Instance Manager refuses to
 restore over data that another request restored (ADR-0008), and the bootstrap
-ends `Failed` and waits for a person.
+ends `Failed` and waits for a person. Nor does it cover a copy that failed
+after it had restored the data when the master changed and changed back
+between the attempts (m0, then m1, then m0 again): a failed attempt clears
+`status.databases[].seeding`, so the next attempt sees m0 in round 0 again and
+sends the same request, and the Instance Manager takes over the data copied
+from m0 before the failover and starts it. That is the Instance Manager's
+existing behaviour; the operator no longer takes a seed backup for such a
+retry (#463), which changes nothing that reaches the member.
 
 Resuming (#107): the key of every step carries the attempt number, so a
 reconcile after an operator restart addresses the operation that is already
