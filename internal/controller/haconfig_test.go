@@ -147,9 +147,10 @@ func TestGenerateHAConf_Rejects(t *testing.T) {
 	}
 }
 
-// The longest accepted cluster name still yields 63-character member names.
+// The longest accepted cluster name (53 characters, constrained by the
+// governing Service <cluster>-instances) yields valid member names.
 func TestGenerateHAConf_LongestName(t *testing.T) {
-	name := strings.Repeat("a", 61)
+	name := strings.Repeat("a", 53)
 	conf, err := generateHAConf(haTestCluster(name))
 	if err != nil {
 		t.Fatalf("generateHAConf: %v", err)

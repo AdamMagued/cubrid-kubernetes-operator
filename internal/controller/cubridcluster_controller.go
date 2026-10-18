@@ -370,6 +370,9 @@ func labelsFor(cluster *databasev1alpha1.CubridCluster) map[string]string {
 }
 
 func (r *CubridClusterReconciler) reconcileHeadlessService(ctx context.Context, cluster *databasev1alpha1.CubridCluster) error {
+	if err := databasev1alpha1.ValidateClusterName(cluster.Name); err != nil {
+		return err
+	}
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      instancesServiceName(cluster.Name),

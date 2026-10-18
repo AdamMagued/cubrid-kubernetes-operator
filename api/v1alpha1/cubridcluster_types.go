@@ -17,11 +17,15 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"fmt"
+	"strings"
+
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	resource "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -613,6 +617,7 @@ type BootstrapStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
+// +kubebuilder:validation:XValidation:rule="!has(self.metadata.name) || (self.metadata.name.size() <= 53 && self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$'))",message="metadata.name must be at most 53 characters and a DNS-1035 label (lowercase alphanumeric and hyphens, starting with a letter and ending with an alphanumeric character) so generated child Service names fit within Kubernetes 63-character limits"
 // CubridCluster is the Schema for the cubridclusters API.
 type CubridCluster struct {
 	metav1.TypeMeta `json:",inline"`
@@ -645,3 +650,26 @@ func init() {
 		return nil
 	})
 }
+
+const (
+	// MaxClusterNameLength is the maximum allowed length of a CubridCluster name.
+	// Constrained to 53 characters because the governing headless Service (<cluster>-instances)
+	// has a 10-character suffix and must not exceed Kubernetes' 63-character RFC 1035 limit.
+	MaxClusterNameLength = 53
+)
+
+// ValidateClusterName validates that a cluster name conforms to the Kubernetes Service name
+// limits (RFC 1035 DNS label, max 53 characters so <cluster>-instances fits in 63 characters).
+func ValidateClusterName(name string) error {
+	if len(name) == 0 {
+		return fmt.Errorf("cluster name cannot be empty")
+	}
+	if len(name) > MaxClusterNameLength {
+		return fmt.Errorf("cluster name %q length %d exceeds maximum allowed length of %d characters: generated child Service names cannot exceed 63 characters", name, len(name), MaxClusterNameLength)
+	}
+	if errs := validation.IsDNS1035Label(name); len(errs) > 0 {
+		return fmt.Errorf("cluster name %q is not a valid DNS-1035 label: %s", name, strings.Join(errs, "; "))
+	}
+	return nil
+}
+
