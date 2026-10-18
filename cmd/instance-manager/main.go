@@ -41,7 +41,7 @@ func main() {
 	// "instance-manager shutdown" is the one trigger of a stop: the preStop
 	// hook and the entrypoint both run it (ADR-0003).
 	if len(os.Args) > 1 && os.Args[1] == "shutdown" {
-		if err := shutdown(logger); err != nil {
+		if err := shutdown(logger, instancemanager.StopFile); err != nil {
 			logger.Error("Shutdown failed", "event", "shutdown_failed", "err", err)
 			os.Exit(1)
 		}
@@ -54,8 +54,8 @@ func main() {
 }
 
 // shutdown asks the manager of this Pod to stop CUBRID, or stops it itself
-// when no manager listens.
-func shutdown(logger *slog.Logger) error {
+// when no manager listens. It records the stop in stopFile first.
+func shutdown(logger *slog.Logger, stopFile string) error {
 	timeouts, err := timeoutsFromEnv()
 	if err != nil {
 		return err
@@ -67,6 +67,12 @@ func shutdown(logger *slog.Logger) error {
 	}
 	cli := instancemanager.LoggingCLI{CLI: instancemanager.ExecCLI{Timeout: budget}, Logger: logger}
 	logger.Info("Shutdown requested", "event", "shutdown_requested")
+	// The stop is recorded before the manager is asked: a manager that does
+	// not listen yet finds the record once it listens and starts nothing
+	// (#323). A record that could not be written does not hold up the stop.
+	if err := instancemanager.RecordStopRequest(stopFile); err != nil {
+		logger.Error("Could not record the stop request", "event", "stop_record_failed", "err", err)
+	}
 	return instancemanager.RequestShutdown(context.Background(), "http://127.0.0.1:"+port,
 		os.Getenv("IM_TOKEN"), envOr("CUBRID_DB", "appdb"), cli, budget)
 }
@@ -101,6 +107,7 @@ func run(logger *slog.Logger) error {
 	cli := instancemanager.LoggingCLI{CLI: instancemanager.ExecCLI{Timeout: 10 * time.Second}, Logger: logger}
 	server := instancemanager.NewServer(cli, token).
 		WithLogger(logger).
+		WithStopFile(instancemanager.StopFile).
 		// A backup may stage only below this root; it is also what a failed
 		// backup removes. It matches the operator's backup staging path.
 		WithBackupStagingRoot(envOr("IM_BACKUP_STAGING_ROOT", "/var/lib/cubrid/backup-staging")).
