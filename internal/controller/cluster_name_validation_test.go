@@ -90,7 +90,7 @@ var _ = Describe("Cluster name validation (#459)", func() {
 
 		// Governing headless Service name (<cluster>-instances).
 		govSvc := instancesServiceName(name)
-		Expect(len(govSvc)).To(Equal(63))
+		Expect(govSvc).To(HaveLen(63))
 		Expect(validation.IsDNS1035Label(govSvc)).To(BeEmpty())
 
 		// Per-member alias Service names (<cluster>-<ordinal>).
@@ -98,38 +98,38 @@ var _ = Describe("Cluster name validation (#459)", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(members).To(HaveLen(3))
 		for _, m := range members {
-			Expect(len(m)).To(Equal(55))
+			Expect(m).To(HaveLen(55))
 			Expect(validation.IsDNS1035Label(m)).To(BeEmpty())
 			Expect(validation.IsDNS1123Label(m)).To(BeEmpty())
 		}
 
 		// IM token secret (<cluster>-im-token).
 		imSecret := imTokenSecretName(name)
-		Expect(len(imSecret)).To(Equal(62))
+		Expect(imSecret).To(HaveLen(62))
 		Expect(validation.IsDNS1123Subdomain(imSecret)).To(BeEmpty())
 
 		// HA ConfigMap (<cluster>-ha-config).
 		haCM := haConfigMapName(name)
-		Expect(len(haCM)).To(Equal(63))
+		Expect(haCM).To(HaveLen(63))
 		Expect(validation.IsDNS1123Subdomain(haCM)).To(BeEmpty())
 
 		// NetworkPolicies.
-		Expect(len(databaseNetworkPolicyName(name))).To(Equal(62))
-		Expect(len(brokerNetworkPolicyName(name))).To(Equal(60))
+		Expect(databaseNetworkPolicyName(name)).To(HaveLen(62))
+		Expect(brokerNetworkPolicyName(name)).To(HaveLen(60))
 
 		// Broker resources.
-		Expect(len(brokerConfigMapName(name))).To(Equal(67))
+		Expect(brokerConfigMapName(name)).To(HaveLen(67))
 		Expect(validation.IsDNS1123Subdomain(brokerConfigMapName(name))).To(BeEmpty())
-		Expect(len(brokerDeploymentName(name, "rw"))).To(Equal(63))
+		Expect(brokerDeploymentName(name, "rw")).To(HaveLen(63))
 		Expect(validation.IsDNS1123Subdomain(brokerDeploymentName(name, "rw"))).To(BeEmpty())
-		Expect(len(rwServiceName(name))).To(Equal(56))
+		Expect(rwServiceName(name)).To(HaveLen(56))
 		Expect(validation.IsDNS1035Label(rwServiceName(name))).To(BeEmpty())
-		Expect(len(roServiceName(name))).To(Equal(56))
+		Expect(roServiceName(name)).To(HaveLen(56))
 		Expect(validation.IsDNS1035Label(roServiceName(name))).To(BeEmpty())
 
 		// StatefulSet name and PVC volumeClaimTemplate naming: data-<cluster>-0.
 		pvcName := "data-" + name + "-0"
-		Expect(len(pvcName)).To(Equal(60))
+		Expect(pvcName).To(HaveLen(60))
 		Expect(validation.IsDNS1123Subdomain(pvcName)).To(BeEmpty())
 	})
 })

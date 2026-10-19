@@ -656,6 +656,9 @@ const (
 	// Constrained to 53 characters because the governing headless Service (<cluster>-instances)
 	// has a 10-character suffix and must not exceed Kubernetes' 63-character RFC 1035 limit.
 	MaxClusterNameLength = 53
+
+	// ErrDNS1035Label is the validation error message when a cluster name is not a valid DNS-1035 label.
+	ErrDNS1035Label = "not a valid DNS-1035 label"
 )
 
 // ValidateClusterName validates that a cluster name conforms to the Kubernetes Service name
@@ -668,8 +671,7 @@ func ValidateClusterName(name string) error {
 		return fmt.Errorf("cluster name %q length %d exceeds maximum allowed length of %d characters: generated child Service names cannot exceed 63 characters", name, len(name), MaxClusterNameLength)
 	}
 	if errs := validation.IsDNS1035Label(name); len(errs) > 0 {
-		return fmt.Errorf("cluster name %q is not a valid DNS-1035 label: %s", name, strings.Join(errs, "; "))
+		return fmt.Errorf("cluster name %q is %s: %s", name, ErrDNS1035Label, strings.Join(errs, "; "))
 	}
 	return nil
 }
-

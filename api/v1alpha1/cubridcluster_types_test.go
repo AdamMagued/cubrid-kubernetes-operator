@@ -65,31 +65,31 @@ func TestValidateClusterName(t *testing.T) {
 			name:    "name with dots rejected",
 			cluster: "prod.example",
 			wantErr: true,
-			errMsg:  "not a valid DNS-1035 label",
+			errMsg:  ErrDNS1035Label,
 		},
 		{
 			name:    "name starting with digit rejected",
 			cluster: "1cluster",
 			wantErr: true,
-			errMsg:  "not a valid DNS-1035 label",
+			errMsg:  ErrDNS1035Label,
 		},
 		{
 			name:    "name ending with hyphen rejected",
 			cluster: "cluster-",
 			wantErr: true,
-			errMsg:  "not a valid DNS-1035 label",
+			errMsg:  ErrDNS1035Label,
 		},
 		{
 			name:    "name with uppercase rejected",
 			cluster: "Cluster",
 			wantErr: true,
-			errMsg:  "not a valid DNS-1035 label",
+			errMsg:  ErrDNS1035Label,
 		},
 		{
 			name:    "name with underscore rejected",
 			cluster: "cluster_name",
 			wantErr: true,
-			errMsg:  "not a valid DNS-1035 label",
+			errMsg:  ErrDNS1035Label,
 		},
 	}
 
