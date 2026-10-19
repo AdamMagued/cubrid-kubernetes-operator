@@ -12,7 +12,7 @@ narrow for the MVP and are widened only after they are validated in CI.
 | Architecture | amd64 | arm64 is not targeted for the MVP. The official CUBRID image is linux/amd64 only. The operator image and the wiring scenario with a fake Instance Manager can be built and run on arm64, but no CI job does so (every workflow runs on `ubuntu-latest`), and the real-engine scenarios are recorded as `not_run` there. |
 | Go toolchain | see `go.mod` | Pinned via `go.mod`; CI uses `go-version-file: go.mod`. |
 | Storage | CSI-backed PVC, `ReadWriteOnce` | Per-instance data volume (ADR-0004, #17). |
-| CSI target | Lab driver TBD (#80) | The Kind e2e runs on Kind's default StorageClass (local-path provisioner, not a CSI driver). No CSI driver has been exercised; a development default is not a validated CSI support claim. |
+| CSI target | Lab driver TBD (#80) | The Kind e2e runs on Kind's default StorageClass (local-path provisioner, not a CSI driver). No CSI driver has been exercised; a development default is not a validated CSI support claim. The lab inventory measured on 2026-10-15 also records k3s `local-path`, which is node-local and not a CSI driver ([dated inventory](testing/lab-inventory.md)). |
 | HA topology | 1 master + 2 slaves (`promotableMembers: 3`) | Standalone `1/0` is also a design target (ADR-0001); live evidence is tracked in ROADMAP.md. |
 | Non-promotable replica | Not supported | `topology.readReplicas` reserved, must be `0` (ADR-0001). |
 

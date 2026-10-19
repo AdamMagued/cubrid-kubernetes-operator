@@ -105,6 +105,28 @@ applicable**, with a revision, environment, command, evidence link and reason.
 A required scenario cannot pass through skipping, missing evidence, a timeout
 or unsuccessful fault injection. A unit test pass is not a live scenario pass.
 
+### Shared lab historical baseline
+
+The [lab inventory](docs/testing/lab-inventory.md) records measurements from
+2026-10-15: k3s `v1.36.5+k3s1`, containerd `2.3.4-k3s1.36`, node-local
+`local-path` storage (not CSI), and locally imported images reported as built
+from `2c39873`. It records measurement scopes and unresolved inventory gaps;
+it does not qualify that configuration for v0.1.
+
+The inventory author reported one manual Pod-deletion run on 2026-10-13 at
+`2c39873`, with three promotable members: after `kubectl delete pod ha-0`,
+`ha-1` reported itself master after 13 s; `Ready=True` returned after 26 s,
+with `ha-0` a slave, and a row written on the new master was readable on
+`ha-0`. These are the observations of that single run, not a scenario pass,
+repeated recovery measurement or VM-failure evidence. The report supplied no
+scenario artifact set or independent transaction-history oracle.
+
+The 2026-10-15 record did not establish VM stop/start or return/recovery,
+network partitions, CSI behavior, an accessible provisioning/cleanup
+reproduction, off-node evidence retention or a target-identity fault guard.
+Those gaps remain tracked by #80/#122; neither the inventory nor the manual
+Pod deletion completes their acceptance conditions.
+
 ## Two-maintainer start order
 
 | Work stream | First independently reviewable result | Handoff |
