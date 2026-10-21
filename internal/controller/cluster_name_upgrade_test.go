@@ -18,16 +18,23 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	databasev1alpha1 "github.com/cubrid-lab/cubrid-kubernetes-operator/api/v1alpha1"
 )
@@ -74,18 +81,95 @@ var _ = Describe("Cluster name validation across a CRD upgrade (#459)", func() {
 		ExpectWithOffset(1, k8sClient.Update(ctx, crd)).To(Succeed())
 	}
 
-	It("allows updates to an existing CubridCluster with a too-long name and refuses new ones", func() {
-		installed := getRootRules()
-
-		// The CRD before #459 differs from this one only by the root rule on
-		// metadata.name.
-		var legacy []any
+	// legacyRules returns the installed root rules and the same rules without
+	// the one on metadata.name. The CRD before #459 differs from this one only
+	// by that rule, so removing it stands in for installing main's CRD.
+	legacyRules := func() (installed, legacy []any) {
+		installed = getRootRules()
 		for _, r := range installed {
 			if !strings.Contains(fmt.Sprint(r.(map[string]any)["rule"]), "metadata.name") {
 				legacy = append(legacy, r)
 			}
 		}
-		Expect(legacy).To(HaveLen(len(installed) - 1))
+		ExpectWithOffset(1, legacy).To(HaveLen(len(installed) - 1))
+		return installed, legacy
+	}
+
+	// createLegacy creates a CubridCluster under the CRD without the name rule
+	// and then installs the rule again, as an upgrade does.
+	createLegacy := func(cluster *databasev1alpha1.CubridCluster) {
+		installed, legacy := legacyRules()
+		probe := func() error { return k8sClient.Create(ctx, cluster.DeepCopy(), client.DryRunAll) }
+		setRootRules(legacy)
+		DeferCleanup(func() { setRootRules(installed) })
+		EventuallyWithOffset(1, probe).Should(Succeed())
+		ExpectWithOffset(1, k8sClient.Create(ctx, cluster)).To(Succeed())
+		DeferCleanup(func() { Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, cluster))).To(Succeed()) })
+		setRootRules(installed)
+		EventuallyWithOffset(1, probe).ShouldNot(Succeed())
+	}
+
+	reconcileOnce := func(cluster *databasev1alpha1.CubridCluster, recorder *record.FakeRecorder) error {
+		r := &CubridClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Recorder: recorder}
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(cluster)})
+		return err
+	}
+	readyReason := func(cluster *databasev1alpha1.CubridCluster) string {
+		c := &databasev1alpha1.CubridCluster{}
+		ExpectWithOffset(1, k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), c)).To(Succeed())
+		if ready := meta.FindStatusCondition(c.Status.Conditions, conditionReady); ready != nil {
+			return ready.Reason
+		}
+		return ""
+	}
+
+	// Every child name and label the operator writes for a 53-character
+	// cluster fits in 63 characters, so such a cluster, which the API accepted
+	// before the 52-character rule, stays managed.
+	It("keeps managing an existing CubridCluster with a 53-character name", func() {
+		cluster := standaloneCluster(strings.Repeat("m", 53))
+		createLegacy(cluster)
+
+		Expect(reconcileOnce(cluster, record.NewFakeRecorder(100))).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: instancesServiceName(cluster.Name), Namespace: cluster.Namespace},
+			&corev1.Service{})).To(Succeed())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), &appsv1.StatefulSet{})).To(Succeed())
+		Expect(readyReason(cluster)).NotTo(Equal(reasonInvalidClusterName))
+	})
+
+	// A longer or non-DNS-1035 name cannot be managed: the operator refuses it
+	// once, creates nothing and does not retry.
+	It("refuses an existing CubridCluster whose name the operator cannot manage", func() {
+		for _, name := range []string{strings.Repeat("x", 54), "9" + strings.Repeat("x", 20)} {
+			cluster := standaloneCluster(name)
+			createLegacy(cluster)
+
+			recorder := record.NewFakeRecorder(100)
+			err := reconcileOnce(cluster, recorder)
+			Expect(err).To(HaveOccurred(), name)
+			Expect(errors.Is(err, reconcile.TerminalError(nil))).To(BeTrue(), "a terminal error for %s: %v", name, err)
+			Expect(readyReason(cluster)).To(Equal(reasonInvalidClusterName), name)
+
+			for _, child := range []struct {
+				name string
+				obj  client.Object
+			}{
+				{instancesServiceName(name), &corev1.Service{}},
+				{imTokenSecretName(name), &corev1.Secret{}},
+				{name, &appsv1.StatefulSet{}},
+			} {
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: child.name, Namespace: cluster.Namespace}, child.obj)
+				Expect(apierrors.IsNotFound(err)).To(BeTrue(), "%T %s: %v", child.obj, child.name, err)
+			}
+
+			Expect(reconcileOnce(cluster, recorder)).To(HaveOccurred())
+			Expect(recorder.Events).To(HaveLen(1), name)
+			Expect(<-recorder.Events).To(HavePrefix("Warning " + reasonInvalidClusterName))
+		}
+	})
+
+	It("allows updates to an existing CubridCluster with a too-long name and refuses new ones", func() {
+		installed, legacy := legacyRules()
 
 		probe := standaloneCluster(strings.Repeat("p", databasev1alpha1.MaxClusterNameLength+1))
 		admitted := func() error { return k8sClient.Create(ctx, probe.DeepCopy(), client.DryRunAll) }

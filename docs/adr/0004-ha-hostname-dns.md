@@ -156,6 +156,15 @@ ha_port_id=59901
   governing Service `<cluster>-instances` and the Broker Deployments
   `<cluster>-broker-rw`/`-ro` follow. A cluster name longer than 52
   characters is rejected on create.
+- The API accepted longer names before the 52-character rule, and the rule
+  does not apply to an update that keeps the name. The operator keeps
+  managing an existing cluster whose name is a DNS-1035 label of at most 53
+  characters: every name and label value the operator writes for it fits in
+  63 characters, and only the StatefulSet's `controller-revision-hash` label
+  can exceed it. A cluster with a longer or non-DNS-1035 name is refused
+  before any child object is written: `Ready` is `False` with reason
+  `InvalidClusterName`, one Warning Event is recorded, and the reconcile is
+  not retried. Such a cluster has to be recreated under a valid name.
 - `ha_db_list` keeps the order of `spec.databases` (ADR-0010).
 - `ha_port_id` is the CUBRID default, written explicitly because the
   heartbeat port is part of the network contract between members.
