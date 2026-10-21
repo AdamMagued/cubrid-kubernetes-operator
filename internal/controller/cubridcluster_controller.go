@@ -432,7 +432,11 @@ func (r *CubridClusterReconciler) refuseClusterName(ctx context.Context, cluster
 	if !same {
 		r.statusEvent(cluster, corev1.EventTypeWarning, reasonInvalidClusterName, msg)
 	}
-	_ = r.writeStatus(ctx, cluster)
+	// A status that could not be written is retried: the refusal itself is
+	// terminal, but its report would otherwise wait for the next change.
+	if err := r.writeStatus(ctx, cluster); err != nil {
+		return ctrl.Result{}, err
+	}
 	return ctrl.Result{}, reconcile.TerminalError(cause)
 }
 
