@@ -671,8 +671,13 @@ type BootstrapStatus struct {
 // +kubebuilder:printcolumn:name="HA",type=string,JSONPath=`.spec.highAvailability.enabled`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+//
+// The name rule runs on create and on update (optionalOldSelf). An update that
+// keeps the name passes it, so a CubridCluster created before the rule existed
+// can still be updated; metadata.name is immutable, so no update can bring in a
+// new invalid name.
+// +kubebuilder:validation:XValidation:rule="(oldSelf.hasValue() && oldSelf.value().metadata.name == self.metadata.name) || !has(self.metadata.name) || (self.metadata.name.size() <= 52 && self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$'))",message="metadata.name must be at most 52 characters and a DNS-1035 label (lowercase alphanumeric and hyphens, starting with a letter and ending with an alphanumeric character) so generated child names and labels fit within Kubernetes 63-character limits",optionalOldSelf=true
 
-// +kubebuilder:validation:XValidation:rule="!has(self.metadata.name) || (self.metadata.name.size() <= 52 && self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$'))",message="metadata.name must be at most 52 characters and a DNS-1035 label (lowercase alphanumeric and hyphens, starting with a letter and ending with an alphanumeric character) so generated child names and labels fit within Kubernetes 63-character limits"
 // CubridCluster is the Schema for the cubridclusters API.
 type CubridCluster struct {
 	metav1.TypeMeta `json:",inline"`
