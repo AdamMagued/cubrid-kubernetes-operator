@@ -239,7 +239,7 @@ spec:
 			record.EngineVersion = strings.TrimSpace(out)
 
 			By("writing and reading a row through csql")
-			sql := csqlInPod(s00Namespace, pod, database)
+			sql := csqlInPod(context.Background(), s00Namespace, pod, database)
 			Expect(writeS00Row(sql, marker)).To(Succeed())
 			Expect(readS00Row(sql, marker)).To(Succeed())
 			// An upper bound: it includes the checks above.
@@ -261,10 +261,9 @@ spec:
 		})
 
 		It("keeps the data when the Pod is deleted", func() {
-			sql := csqlInPod(s00Namespace, pod, database)
-			podReady := func() bool {
-				out, err := kubectl("get", "pod", pod,
-					"-o", `jsonpath={.status.conditions[?(@.type=="Ready")].status}`)
+			podReady := func(ctx context.Context) bool {
+				out, err := utils.Run(exec.CommandContext(ctx, "kubectl", "-n", s00Namespace, "get", "pod", pod,
+					"-o", `jsonpath={.status.conditions[?(@.type=="Ready")].status}`))
 				return err == nil && out == "True"
 			}
 
@@ -272,10 +271,12 @@ spec:
 			outcome := faults.Run(context.Background(), faults.Scenario{
 				Fault:  podDeletion{namespace: s00Namespace, pod: pod, uid: record.PodUID},
 				Limits: podDeletionLimits,
-				Before: func(context.Context) error { return readS00Row(sql, marker) },
+				Before: func(ctx context.Context) error {
+					return readS00Row(csqlInPod(ctx, s00Namespace, pod, database), marker)
+				},
 				// The row written before the deletion is read from the new Pod.
-				Check: func(context.Context) (bool, error) {
-					return podReady() && readS00Row(sql, marker) == nil, nil
+				Check: func(ctx context.Context) (bool, error) {
+					return podReady(ctx) && readS00Row(csqlInPod(ctx, s00Namespace, pod, database), marker) == nil, nil
 				},
 			})
 			podDeletionOutcome = &outcome
@@ -349,8 +350,11 @@ var podDeletionLimits = faults.Limits{
 // the same name exists with another UID: the exit code of the delete command
 // is not relied on. There is nothing to remove afterwards.
 //
-// With force the Pod gets no termination grace period: its containers are
-// killed without the preStop hook and without SIGTERM.
+// With force the Pod gets no termination grace period: the Pod object is
+// removed at once, but its containers still run the preStop hook, get
+// SIGTERM about one second later and are killed about three seconds after
+// the deletion, and the replacement's container can start before that
+// (docs/poc/RESULTS.md, POC-28, part 1).
 type podDeletion struct {
 	namespace, pod, uid string
 	force               bool

@@ -114,6 +114,24 @@ var errStagingInUse = errors.New("a running operation of another request owns th
 // another request body. Sending the start again never succeeds.
 var errRequestConflict = errors.New("the member holds an operation under this key for another request")
 
+// errOperationMissing is wrapped by a poll of an operation that the member
+// answered 404: it holds no record of it.
+var errOperationMissing = errors.New("the member holds no record of the operation")
+
+// errOperationRecordUnreadable is wrapped by a start that the member refused
+// because its operation store holds a record it cannot read (500,
+// OperationRecordUnreadable). Nothing was started; it is retryable once the
+// record is readable again or removed by hand, so it uses up no attempt.
+var errOperationRecordUnreadable = errors.New("the member's Instance Manager holds an operation record it cannot read")
+
+// reasonOperationRecordUnreadable is the condition reason of a start refused
+// with errOperationRecordUnreadable, and runbookUnreadableRecord the runbook
+// its message points at.
+const (
+	reasonOperationRecordUnreadable = "InstanceManagerOperationRecordUnreadable"
+	runbookUnreadableRecord         = "Runbook: an operation record that cannot be read"
+)
+
 // maxErrorBody bounds what is read of an error answer, and maxErrorMessage
 // the length of the message taken from it. Of a larger answer at most
 // maxErrorDrain bytes more are read and discarded.
@@ -159,20 +177,36 @@ func tokenRefused(status int) bool {
 // 401 and 403 refuse the token, 412 means no object storage, and 409 is a
 // conflict of no named cause.
 func unexpectedStatus(resp *http.Response) error {
-	code, msg := readErrorAnswer(resp)
-	detail := fmt.Sprintf("status %d", resp.StatusCode)
+	code, _, detail := describeAnswer(resp)
+	return statusError(resp, code, detail)
+}
+
+// describeAnswer reads an error answer (readErrorAnswer) and describes it
+// with its status, code, message and request.
+func describeAnswer(resp *http.Response) (code, msg, detail string) {
+	code, msg = readErrorAnswer(resp)
+	detail = fmt.Sprintf("status %d", resp.StatusCode)
 	if code != "" {
 		detail += ", " + code
 	}
 	if msg != "" {
 		detail += ": " + msg
 	}
-	detail += requestRef(resp)
+	return code, msg, detail + requestRef(resp)
+}
+
+// statusError is unexpectedStatus for an answer describeAnswer has read.
+func statusError(resp *http.Response, code, detail string) error {
 	switch {
 	case tokenRefused(resp.StatusCode):
 		return fmt.Errorf("%w (%s)", errTokenRefused, detail)
 	case resp.StatusCode == http.StatusPreconditionFailed:
 		return fmt.Errorf("%w (%s)", errObjectStorageNotApplied, detail)
+	// The code is taken at any status: the manager answers it with 500, and
+	// startError still counts a 400, 413 or 422 as a refused request.
+	case code == instancemanager.CodeOperationRecordUnreadable:
+		return fmt.Errorf("%w (%s); see the runbook %q in docs/observability.md",
+			errOperationRecordUnreadable, detail, runbookUnreadableRecord)
 	case resp.StatusCode != http.StatusConflict:
 		return fmt.Errorf("unexpected %s", detail)
 	}
@@ -248,8 +282,9 @@ func cleanMessage(msg string) string {
 }
 
 // instanceManagerFailureReason is the condition reason for a failed call to
-// an Instance Manager: a refused token, a manager without object storage and
-// each cause of a conflict are told apart from an unavailable manager.
+// an Instance Manager: a refused token, a manager without object storage,
+// each cause of a conflict and an unreadable operation record are told apart
+// from an unavailable manager.
 func instanceManagerFailureReason(err error) string {
 	switch {
 	case errors.Is(err, errTokenRefused):
@@ -268,6 +303,8 @@ func instanceManagerFailureReason(err error) string {
 		return reasonRequestRefused
 	case errors.Is(err, errStartConflict):
 		return reasonConflict
+	case errors.Is(err, errOperationRecordUnreadable):
+		return reasonOperationRecordUnreadable
 	}
 	return reasonInstanceManagerUnavailable
 }
@@ -441,6 +478,19 @@ func (c *HTTPBackupClient) GetOperation(ctx context.Context, podName, namespace,
 		return instancemanager.Operation{}, fmt.Errorf("get operation %s on %s: %w", id, podName, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
+		// Only the manager's own answer that it holds no such record is a
+		// missing record. A manager without an operation store answers 404
+		// too ("operations are not enabled"), and so would a proxy or an
+		// earlier image without the route: those could not be asked.
+		code, msg, detail := describeAnswer(resp)
+		if msg == instancemanager.ErrOperationNotFound.Error() {
+			return instancemanager.Operation{}, fmt.Errorf("get operation %s on %s: %w (%s)", id, podName,
+				errOperationMissing, detail)
+		}
+		return instancemanager.Operation{}, fmt.Errorf("get operation %s on %s: %w", id, podName,
+			statusError(resp, code, detail))
+	}
 	if resp.StatusCode != http.StatusOK {
 		return instancemanager.Operation{}, fmt.Errorf("get operation %s on %s: %w", id, podName, unexpectedStatus(resp))
 	}

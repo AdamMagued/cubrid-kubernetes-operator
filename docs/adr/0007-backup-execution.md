@@ -76,7 +76,8 @@ itself. A Kubernetes Job is **not** in the v1alpha1 critical path
 
 - **Operator:** watch/validate `CubridBackup`; resolve target via
   ADR-0005 role/health; call `/v1/backup` with
-  `Idempotency-Key = cubridbackup:<ns>:<name>:<uid>:<attempt>`; poll
+  `Idempotency-Key = cubridbackup:<ns>:<name>:<uid>` (as implemented, no
+  attempt part; `idempotencyKey` in `internal/controller/cubridbackup_controller.go`); poll
   `/v1/operations/{id}`; update CR + cluster-level backup summary.
 - **Instance Manager:** create a durable operation record; run
   `backupdb.sh` / `cubrid backupdb` locally; capture command/db/role-at-
@@ -96,7 +97,31 @@ no ambiguous/incomplete primary observation (ADR-0005) — so backup load
 never lands on a suspected master during unsafe failover evidence; it
 records `fallbackUsed: true`, `targetRole: master`, reason
 `MasterFallbackSelected`. `StandbyOnly`
-fails if no eligible slave. **Backup on master is allowed** (fallback,
+waits if no slave is eligible. As implemented (#291,
+`internal/controller/backuptarget.go`), a slave is eligible for a new
+selection only on fresh evidence that it follows the master: it is
+authoritatively observed as a slave in this reconcile's observation, its
+log applier was read in the same observation, it applies the log of the
+resolved primary, it has failed no change (`failCount` 0), and the stall
+series that reading continues (from the cluster status' replication
+history) has not reached the 60 s stall window of `ReplicationHealthy`.
+Eligible slaves are ordered by the log pages waiting to be applied
+(`delayedPages`), then by ordinal. Missing evidence never counts as caught
+up: a slave whose applier could not be read is not eligible, and no slave is
+eligible while the primary is not resolved, so `StandbyOnly` waits
+(`NoHealthyStandby`) and `PreferStandby` falls back to the master only under
+the rule above. That also holds when the applier cannot be read at all,
+because the Instance Manager is older and reports no replication or because
+`applyinfo` timed out under load: that slave is not eligible, so
+`PreferStandby` then falls back to the master. A `failCount` greater than 0
+excludes a slave for as long as the applier's counter keeps it. A long transaction on the master can keep pages waiting
+with nothing applied and so exclude a slave that is not behind (#249); that
+only moves the backup to another slave or to the master fallback. A target
+already recorded is not judged again on its replication (an earlier dispatch
+to it may run); it must still be authoritatively a slave. Pod readiness is
+not evaluated, and the `FencingRequired` check has no input because no step
+sets that Condition.
+**Backup on master is allowed** (fallback,
 health-checked) but not preferred. If all roles are `unknown`: single
 instance → allow with reason `RoleUnknownSingleInstanceFallback`; HA
 cluster → fail for `PreferStandby` (avoid accidentally loading the true
@@ -139,7 +164,18 @@ neither case is another member started, then or later. The bound is not the
 time a backup takes: an adopted operation is polled until it ends. While its
 member is reachable the Instance Manager's backup time limit
 (`IM_BACKUP_TIMEOUT`, default 2h) ends it; while the member does not answer,
-the operator keeps polling until it does. It covers a
+the operator keeps polling until it does. A member that answers that it
+holds no record of the recorded operation (`404` on
+`GET /v1/operations/{id}`, for example after its operation store was lost or
+replaced) is told apart from one that does not answer (#457): the backup
+reports `RecordedOperationMissing` and waits 30 minutes from
+`status.operationMissingSince`, which only a read of the operation clears,
+so an operator restart or a failure to ask in between does not reset it.
+Then the backup ends `Failed` with reason `RecordedOperationLost`, naming the
+member and the operation. A missing record does not show that the work
+ended, so the reason says that a backup may still run there and upload under
+the backup's prefix; the backup is not started again, on that member or
+another, and no artifact is recorded. It covers a
 member restart or a failover and its settling, and an operator who restarts
 a Pod to apply `spec.objectStorage`. Limit: a start delayed in the network
 beyond the bound and the lookup could still be taken after the backup ended
@@ -184,9 +220,26 @@ ends, also one that was refused, has `status.completedAt`.
   in the destination is uploaded, so a file that an interrupted attempt
   left never enters a later manifest. The operation removes its directory,
   and the destination once it is empty, when it fails or completes.
+  The file of `backupdb -C` is written by `cub_server`, outside the
+  utility's process group that a cancellation ends: after the group was
+  killed, `cub_server` kept the file open for about 0.3 to 2 s, then removed
+  it or left it at its full size (POC-27). A failed backup therefore removes
+  its directory only once no process holds a file below it, read from
+  `/proc/<pid>/fd` (the manager runs in the CUBRID container as the same
+  user as `cub_server`), and looks again every 200 ms for up to 30 s,
+  15 times the longest hold seen, and inside the stop's wait for the
+  operations. A directory still held after that is kept as it is, never
+  uploaded or reused, and the operation's failure reason says so (#469). A
+  CUBRID process (`cub*`) whose open files cannot be read, or a process list
+  that cannot be read, counts as a holder (fail closed); a process of
+  another user, or one of the same user that does not let its files be
+  read, is not one CUBRID started for the backup and is skipped. The
+  manager never signals `cub_server` for this.
   Ownership of the staging (#275): an entry of a destination belongs to a
   live operation when it is named after an operation that the store records
-  as not ended, or whose record cannot be read. A request whose destination
+  as not ended, or whose record cannot be read, or when a process holds a
+  file in it, or its holders cannot be told (#469); an entry that is a link
+  is not followed and never counts as held. A request whose destination
   holds an entry of a live operation of another request is answered 409
   with "the backup staging destination is owned by another operation that
   is still running" (`ErrBackupStagingInUse`), before anything is recorded,
@@ -211,10 +264,45 @@ ends, also one that was refused, has `status.completedAt`.
 
   ```text
   s3://<bucket>/<prefix>/<cluster-uid>/<database>/<backup-uid>/
-    manifest.json        # written LAST = atomic completion marker
-    backup/<cubrid files>
-    logs/backupdb.log
+    attempt-<fresh-upload-id>/
+      manifest.json      # written LAST = atomic completion marker
+      backup/<cubrid files>
   ```
+
+Each ordinary upload generates a fresh cryptographically random 128-bit ID,
+including a retry after its operation store was lost or an operation ID was
+reused. Its whole artifact is below `attempt-<32-hex-id>/`. The returned
+manifest URI is recorded in the operation and `CubridBackup.status.artifact`;
+consumers use that exact URI, never infer one from the requested parent prefix.
+There is no manifest pointer at the parent and no last-writer selection. Two
+concurrent attempts may both complete at distinct URIs without modifying each
+other. An incomplete attempt has no completed manifest; failed, cancelled or
+ambiguous uploads leave their remote attempt objects in place and never remove
+another attempt. Remote attempt retention/garbage collection requires an
+explicit separate policy. Legacy manifest-v1 URIs and the relative
+`backup/<original filename>` layout remain readable without a schema change.
+The manager, not a caller-supplied operation ID, generates the upload ID.
+A new Operator with an older Instance Manager does not acquire this protection:
+the updated Instance Manager must be deployed before claiming immutable ordinary
+artifacts. Deploy the updated Operator before updating Instance Managers: an
+older Operator omits `seed: true`, so a new manager would isolate its seed
+upload while the old controller tried to restore the obsolete stable location.
+Use the matching controller for HA seeding; for a rollback, revert the Instance
+Managers before reverting the Operator. The ordinary-artifact protection is
+absent again on the old manager. There is no version-negotiation guarantee for
+mixed controller/manager versions. Existing artifact URIs do not move.
+
+The HA seed exception below uses explicit `upload.seed: true`, supplied by the
+bootstrap controller. A seed upload is accepted only with master source
+metadata and the clean suffix `<cluster-uid>/seed[-<artifact>]/<database>`;
+ordinary `CubridBackup` destinations end in their backup UID and cannot use
+that mode. This is authenticated request metadata, not independent proof of
+the caller's identity as a controller or the engine's actual role. The stable
+seed prefix and restore request body remain unchanged, preserving restore
+takeover/idempotency. An older recorded seed backup request without the field
+can conflict by hash; the existing 409 lookup adopts its recorded operation
+instead of dispatching another one. The earlier manager/seed artifact behavior
+remains a compatibility consideration, separate from ordinary artifact safety.
 
 - **ADR-0006 rebuild consumes the object-storage manifest** (download +
   verify checksum/manifest before restore), **not** a direct
@@ -228,8 +316,19 @@ ends, also one that was refused, has `status.completedAt`.
 - **Artifact trust:** restore/rebuild must **reject** any manifest whose
   `database`, `clusterUID`, `cubridVersion`, `level`, or expected
   source-role policy does not match the intended operation, in addition
-  to per-file checksum validation. A `PVC` destination (reserved; not run,
-  see below) is **not eligible** for ADR-0006 rebuild or disaster recovery.
+  to per-file checksum validation. As implemented (#276), the Instance
+  Manager checks this at the restore boundary, before anything is
+  downloaded into staging, registered in `databases.txt` or run: every
+  restore takes only a full backup (`level` 0) of the request's database
+  and engine version; a seed restore (`seedFromMaster`) takes only a backup
+  whose manifest declares that master as `sourceInstance` and `master` as
+  `sourceRole` (the role the operator declared when it requested the backup),
+  and, when the request carries `expectedClusterUID` (the operator always
+  sends it for a seed), whose `clusterUID` is that cluster's. A restore into
+  a new cluster takes another cluster's full backup from a standby or the
+  master. The engine version is still compared as the declared string
+  (#321). A `PVC` destination (reserved; not run, see below) is **not
+  eligible** for ADR-0006 rebuild or disaster recovery.
 
 ### `CubridBackup` CR (v1alpha1)
 
@@ -331,7 +430,12 @@ Uploading → Completed | Failed | CleaningUp`. Operator restart → re-poll
 by operation ref / idempotency key. Manager restart → reconstruct from
 records + filesystem facts. **Successful `backupdb` ≠ successful backup**
 — success requires upload + checksum + `manifest.json`. Never overwrite a
-completed artifact; retries are new attempts. Restore/rebuild trust an
+completed ordinary artifact; retries have distinct artifact URIs. A seed backup
+of an HA member (ADR-0010) is the exception: its place names the source and the round, not
+the attempt, so a retry's seed backup replaces the earlier attempt's at the
+same place, and a seed restore retry that takes over the data the earlier
+attempt already restored takes no new seed backup at all (ADR-0008, #463).
+Restore/rebuild trust an
 artifact **only** if `manifest.json` exists and validates all listed
 objects (per-file hashes + metadata: CUBRID version, db, level, source
 cluster UID/instance/role, timestamps).
@@ -350,6 +454,9 @@ sizeBytes, cubridVersion, database, level}`, `conditions`
 `InstanceManagerStagingInUse`, `InstanceManagerRequestConflict`,
 `InstanceManagerConflict` (a 409 by the cause its code names, ADR-0003; each
 waits on the recorded target like any refused start),
+`InstanceManagerOperationRecordUnreadable` (a 500 `OperationRecordUnreadable`:
+the member holds an operation record it cannot read; waits like an
+unavailable member, #481),
 `InstanceManagerRequestRefused` (a start refused as a request, 400, 413 or
 422, ADR-0003: the backup ends `Failed` unless the target holds an
 operation of it, and waits within the bound while that cannot be asked),
@@ -357,8 +464,14 @@ operation of it, and waits within the bound while that cannot be asked),
 `ObjectStorageNotApplied`, `UnsupportedDestination`, `InvalidBackupDestination`,
 `RecordedTargetNotEligible`,
 `RecordedTargetNotStarted`, `RecordedTargetUnverified`, `ObjectStorageWaitExpired`,
+`RecordedOperationMissing`, `RecordedOperationLost`,
 `ObjectStorageUnavailable`). Cluster-level: `BackupReady`
-(True/False/Unknown) + `lastSuccessfulBackupRef`/artifact summary.
+(True/False/Unknown) + `lastSuccessfulBackupRef`/artifact summary. As
+implemented, `ChecksumMismatch`, `InsufficientStagingSpace` and
+`ObjectStorageUnavailable` are not produced (a backup operation that fails on
+the member ends `Failed` with `BackupFailed` and the operation's reason in
+the message), and the cluster has no
+`BackupReady` Condition and no backup summary in its status.
 **Backup state must not be conflated with cluster/HA readiness.**
 
 ## Consequences
@@ -404,6 +517,24 @@ operation of it, and waits within the bound while that cannot be asked),
     queued (ADR-0003 policy).
 15. Role change during backup — source role recorded at start; outcome
     conservative.
+
+The focused storage-publication regression is opt-in:
+
+```sh
+CUBRID_TEST_S3_ENDPOINT=127.0.0.1:<port> \
+CUBRID_TEST_S3_ACCESS_KEY="$TEST_ACCESS_KEY" \
+CUBRID_TEST_S3_SECRET_KEY="$TEST_SECRET_KEY" \
+go test ./internal/instancemanager -run '^TestUploadBackup_RealS3$' -count=1 -v
+```
+
+Use a dedicated loopback S3 service; the test refuses non-loopback targets,
+creates a uniquely named bucket and removes only that bucket and its objects.
+It interleaves two uploads before either manifest, verifies both artifacts and
+original restore filenames, and injects a lost result after the backend stored
+a manifest. This establishes the object-store publication boundary. It does
+not execute `backupdb`, replace a PVC or certify the integrated #88 scenarios.
+The ordinary unit suite covers data/verification/manifest failures, a reset
+operation store, legacy artifacts and the explicit seed exception.
 
 ## Revisit When
 

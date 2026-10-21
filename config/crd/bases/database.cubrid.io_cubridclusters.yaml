@@ -818,6 +818,15 @@ spec:
                             it was started.
                           format: int64
                           type: integer
+                        applier:
+                          description: |-
+                            applier identifies the applier process these counters were read
+                            beside. The value is opaque and is only compared for equality. The
+                            counters outlast the process, so a change of it starts a new series: a
+                            restarted applier does not inherit the age of stalledSince. Empty when
+                            the Instance Manager could not identify the process; an empty value on
+                            either side decides nothing.
+                          type: string
                         delayedPages:
                           description: delayedPages is the number of copied log pages
                             that are not applied yet.
@@ -843,7 +852,9 @@ spec:
                           description: |-
                             stalledSince is when the operator first saw log pages waiting while the
                             applier had applied nothing since the reading before. It is cleared
-                            as soon as the applier applies something or no page waits.
+                            as soon as the applier applies something or no page waits, and starts
+                            again at the current reading when the applier process changes while
+                            pages still wait.
                           format: date-time
                           type: string
                       required:
@@ -858,6 +869,38 @@ spec:
                       - replica
                       - unknown
                       type: string
+                    unfinishedDatabase:
+                      description: |-
+                        unfinishedDatabase is set while the member's Instance Manager reports
+                        that the member's database carries the marker of a createdb or
+                        restoredb that did not finish: the database is neither created over nor
+                        started. It is taken from the answer that set lastObservedTime in the
+                        same observation; a member that gave no answer that counts keeps its
+                        last report. It is absent for the marker of an operation that runs now,
+                        which the bootstrap status reports. It does not change role.
+                      properties:
+                        database:
+                          description: database is the name of the database.
+                          type: string
+                        message:
+                          description: message is the Instance Manager's reason for
+                            the state.
+                          type: string
+                        operation:
+                          description: |-
+                            operation is the Instance Manager operation the marker names; empty
+                            when it names none.
+                          type: string
+                        state:
+                          description: state is WaitingForOperation or Refused.
+                          enum:
+                          - WaitingForOperation
+                          - Refused
+                          type: string
+                      required:
+                      - database
+                      - state
+                      type: object
                   required:
                   - name
                   type: object

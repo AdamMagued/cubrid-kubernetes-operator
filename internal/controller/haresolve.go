@@ -193,6 +193,10 @@ type PrimaryResolution struct {
 	CurrentPrimary string
 	Status         metav1.ConditionStatus
 	Reason         string
+	// MultipleMasters preserves the authoritative multiple-master verdict and
+	// also reports fresh local master claims independently of primary authority.
+	// Conflicting claims can keep Ready false without authorizing a primary.
+	MultipleMasters bool
 	// TokenRefused names the members whose Instance Manager refused the
 	// cluster's token, when the reason is reasonTokenRefused.
 	TokenRefused []string
@@ -233,12 +237,16 @@ const reasonMultiplePrimaries = "MultiplePrimariesObserved"
 // like an unreachable one; the reason only names the cause.
 func resolvePrimary(members []string, obs map[string]RoleObservation, now time.Time) PrimaryResolution {
 	masters := 0
+	masterClaims := 0
 	primary := ""
 	incomplete := false
 	ambiguous := false
 	var refused []string
 	for _, m := range members {
 		o, ok := obs[m]
+		if fresh(o, now) && o.Role == databasev1alpha1.RoleMaster && o.ActiveMasterClaim {
+			masterClaims++
+		}
 		if ok && o.Reachable && o.Conflicting {
 			ambiguous = true
 			continue
@@ -256,33 +264,38 @@ func resolvePrimary(members []string, obs map[string]RoleObservation, now time.T
 		}
 	}
 
+	res := PrimaryResolution{Status: metav1.ConditionFalse, MultipleMasters: masters > 1 || masterClaims > 1}
 	switch {
 	case masters > 1:
-		return PrimaryResolution{Status: metav1.ConditionFalse, Reason: reasonMultiplePrimaries}
+		res.Reason = reasonMultiplePrimaries
 	case ambiguous:
-		return PrimaryResolution{Status: metav1.ConditionFalse, Reason: "AmbiguousPrimaryObservation"}
+		res.Reason = "AmbiguousPrimaryObservation"
 	case len(refused) > 0:
-		return PrimaryResolution{Status: metav1.ConditionFalse, Reason: reasonTokenRefused, TokenRefused: refused}
+		res.Reason, res.TokenRefused = reasonTokenRefused, refused
 	case incomplete:
-		return PrimaryResolution{Status: metav1.ConditionFalse, Reason: "PrimaryObservationIncomplete"}
+		res.Reason = "PrimaryObservationIncomplete"
 	case masters == 0:
-		return PrimaryResolution{Status: metav1.ConditionFalse, Reason: "NoPrimaryObserved"}
+		res.Reason = "NoPrimaryObserved"
 	default:
-		return PrimaryResolution{CurrentPrimary: primary, Status: metav1.ConditionTrue, Reason: "SinglePrimaryObserved"}
+		res.CurrentPrimary, res.Status, res.Reason = primary, metav1.ConditionTrue, "SinglePrimaryObserved"
 	}
+	return res
 }
 
 // instanceStatuses builds the per-instance status list from observations,
 // preserving the ordinal ordering of members. previous is the list of the
 // reconcile before: a slave's replication is judged against what it reported
-// then, and a member that gave no answer keeps the time of its last one.
+// then, and a member that gave no answer keeps the time of its last one and
+// its last report of an unfinished database.
 func instanceStatuses(members []string, obs map[string]RoleObservation, now time.Time,
 	previous []databasev1alpha1.InstanceStatus) []databasev1alpha1.InstanceStatus {
 	before := make(map[string]*databasev1alpha1.InstanceReplication, len(previous))
 	answered := make(map[string]*metav1.Time, len(previous))
+	reported := make(map[string]*databasev1alpha1.InstanceUnfinishedDatabase, len(previous))
 	for _, in := range previous {
 		before[in.Name] = in.Replication
 		answered[in.Name] = in.LastObservedTime
+		reported[in.Name] = in.UnfinishedDatabase
 	}
 	out := make([]databasev1alpha1.InstanceStatus, 0, len(members))
 	for i, m := range members {
@@ -303,9 +316,14 @@ func instanceStatuses(members []string, obs map[string]RoleObservation, now time
 		// not the prober's stamp: an equal time means the member answered in
 		// that pass. An answer that contradicts itself or names another
 		// member is not counted as this member's answer.
+		// An unfinished database is reported from the same answer, whatever
+		// role it carries; without one the last report is kept, so that a
+		// missed probe neither clears it nor reports it again.
+		unfinished := reported[m].DeepCopy()
 		if o, ok := obs[m]; ok && fresh(o, now) && !o.Conflicting {
 			at := metav1.NewTime(now)
 			lastObserved = &at
+			unfinished = o.Unfinished
 		}
 		// Only an authoritative slave's applier is taken into account. A
 		// slave whose applier could not be read keeps its last reading; a
@@ -323,6 +341,7 @@ func instanceStatuses(members []string, obs map[string]RoleObservation, now time
 			ObservedEngineVersion: version,
 			Replication:           replication,
 			LastObservedTime:      lastObserved,
+			UnfinishedDatabase:    unfinished,
 		})
 	}
 	return out

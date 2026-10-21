@@ -185,10 +185,14 @@ func TestServer_Backup_CompletesAfterUpload(t *testing.T) {
 	if final.State != OpCompleted {
 		t.Fatalf("final state = %s (reason %q), want Completed", final.State, final.FailureReason)
 	}
-	if final.Artifact == nil || final.Artifact.ManifestURI != "s3://cubrid-backups/prod/uid-1/manifest.json" {
-		t.Errorf("artifact = %+v", final.Artifact)
+	if final.Artifact == nil {
+		t.Fatalf("artifact = %+v", final.Artifact)
 	}
-	if _, ok := objStore.objects["cubrid-backups/prod/uid-1/manifest.json"]; !ok {
+	prefix := uploadedPrefix(t, final.Artifact.ManifestURI, "cubrid-backups")
+	if !strings.HasPrefix(prefix, "prod/uid-1/attempt-") {
+		t.Fatalf("artifact prefix = %q", prefix)
+	}
+	if _, ok := objStore.objects["cubrid-backups/"+prefix+"/manifest.json"]; !ok {
 		t.Error("manifest.json was not uploaded on completion")
 	}
 }
@@ -218,8 +222,9 @@ func TestServer_Convergence_RequiresParams(t *testing.T) {
 }
 
 func TestServer_Convergence_ReportsFacts(t *testing.T) {
-	h := newAsyncServer(t, fakeCLI{out: convergedApplyinfo})
-	req := httptest.NewRequest("GET", "/v1/ha/convergence?database=appdb&copiedLogPath=/x", nil)
+	databases := t.TempDir()
+	h := NewServer(fakeCLI{out: convergedApplyinfo}, "tok").WithReplication(dbName, databases).Handler()
+	req := httptest.NewRequest("GET", "/v1/ha/convergence?database=appdb&copiedLogPath="+filepath.Join(databases, "appdb_db-0"), nil)
 	req.Header.Set("Authorization", "Bearer tok")
 	req.RemoteAddr = testRemoteAddr
 	rr := httptest.NewRecorder()
@@ -270,8 +275,10 @@ func pollUntilSettled(t *testing.T, srv *Server, h http.Handler, id string) Oper
 var testStagingRoot = filepath.Join(os.TempDir(), "im-test-staging")
 
 // testUpload is the upload of the handler tests' backup requests: an
-// asynchronous backup without one is refused (#290).
-var testUpload = &BackupUpload{Bucket: "cubrid-backups", Prefix: "prod/uid-1"}
+// asynchronous backup without one is refused (#290), and so is an upload
+// without every field the manifest needs (#301).
+var testUpload = &BackupUpload{Bucket: "cubrid-backups", Prefix: "prod/uid-1", ClusterUID: "uid-1",
+	CubridVersion: "11.4", SourceInstance: "db-0", SourceRole: "slave"}
 
 // backupBody is a backup request of appdb staged at destination.
 func backupBody(destination string) string {

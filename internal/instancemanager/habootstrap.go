@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -98,9 +97,8 @@ func (s *Server) haBootstrap(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, CodeNotAnHAMember, "this member is a standalone server, not an HA member")
 		return
 	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{errKey: msgUnreadableBody})
+	body, ok := readBody(w, r)
+	if !ok {
 		return
 	}
 	var req HABootstrapRequest
@@ -131,7 +129,7 @@ func (s *Server) haBootstrap(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, err)
 		return
 	case err != nil:
-		writeJSON(w, http.StatusInternalServerError, map[string]string{errKey: err.Error()})
+		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
 	if !existed {
@@ -149,7 +147,7 @@ func (s *Server) runHABootstrap(id string, req HABootstrapRequest) {
 		defer cancel()
 		fail := func(reason string) {
 			reason = s.stoppingReason(reason)
-			_, _ = s.store.Update(id, func(op *Operation) {
+			_ = s.store.Settle(id, func(op *Operation) {
 				op.State = OpFailed
 				op.FailureReason = reason
 			})
@@ -168,6 +166,7 @@ func (s *Server) runHABootstrap(id string, req HABootstrapRequest) {
 		}
 		if !registered {
 			if _, err := s.store.Update(id, func(op *Operation) { op.State = OpCreating }); err != nil {
+				fail(notRecorded(OpCreating, err))
 				return
 			}
 			if err := createHADatabase(ctx, s.cli, s.restoreRoots.Target, s.ha, req.Database, id); err != nil {
@@ -188,6 +187,7 @@ func (s *Server) runHABootstrap(id string, req HABootstrapRequest) {
 		}
 		if hb.startable {
 			if _, err := s.store.Update(id, func(op *Operation) { op.State = OpStarting }); err != nil {
+				fail(notRecorded(OpStarting, err))
 				return
 			}
 			if out, err := s.activate(ctx, "heartbeat", "start"); err != nil {
@@ -195,7 +195,7 @@ func (s *Server) runHABootstrap(id string, req HABootstrapRequest) {
 				return
 			}
 		}
-		_, _ = s.store.Update(id, func(op *Operation) { op.State = OpCompleted })
+		_ = s.store.Settle(id, func(op *Operation) { op.State = OpCompleted })
 	}()
 }
 

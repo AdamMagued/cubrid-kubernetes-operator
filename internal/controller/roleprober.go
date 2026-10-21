@@ -46,6 +46,10 @@ type RoleObservation struct {
 	// (role vs HA status, ADR-0005 ConflictingLocalHAStatus) or names a member
 	// other than the one that was asked; the role is then not trusted.
 	Conflicting bool
+	// ActiveMasterClaim preserves a locally consistent active-master report
+	// even when another master in the node list makes the role untrusted.
+	// It is diagnostic evidence for Ready, never authority to name a primary.
+	ActiveMasterClaim bool
 	// MasterNotYetActive is set when the answer contradicts itself in one way
 	// only: the member reports itself master while its server is not
 	// registered_and_active. That is the state of the master of a group
@@ -70,6 +74,10 @@ type RoleObservation struct {
 	// RequestID is the ID the role query was sent with; empty when none was
 	// sent.
 	RequestID string
+	// Unfinished is the member's database as the Instance Manager reports it
+	// when the database carries the marker of an unfinished createdb or
+	// restoredb; nil when it reports none. It is independent of Role.
+	Unfinished *databasev1alpha1.InstanceUnfinishedDatabase
 }
 
 // RoleProber polls one instance's Instance Manager /v1/role endpoint.
@@ -130,6 +138,9 @@ func (p *HTTPRoleProber) ProbeRole(ctx context.Context, podName, namespace strin
 	}
 	o := observationFromStatus(st, p.now())
 	o.RequestID = id
+	if st.Current != podName {
+		o.ActiveMasterClaim = false
+	}
 	// The answer is recorded under the name that was asked. An answer that
 	// carries a role but names another member came from somewhere else, a
 	// wrong DNS record or Service for example, and is not this member's role.
@@ -180,7 +191,7 @@ func (p *HTTPRoleProber) now() time.Time {
 func observationFromStatus(st instancemanager.HAStatus, at time.Time) RoleObservation {
 	o := RoleObservation{
 		Reachable: true, Role: databasev1alpha1.CubridRole(st.Role), ObservedAt: at,
-		EngineVersion: st.EngineVersion,
+		EngineVersion: st.EngineVersion, Unfinished: unfinishedFromStatus(st.Unfinished),
 	}
 	if st.Role != instancemanager.RoleMaster && st.Role != instancemanager.RoleSlave {
 		if st.Role == instancemanager.RoleUnknown || st.Role == "" {
@@ -197,18 +208,27 @@ func observationFromStatus(st instancemanager.HAStatus, at time.Time) RoleObserv
 			AppliedChanges: int64(r.AppliedChanges),
 			FailCount:      int64(r.FailCount),
 			DelayedPages:   int64(r.DelayedPageCount),
+			Applier:        r.Applier,
 		}
 	}
 	notYetActive := st.Role == instancemanager.RoleMaster && !st.ServerActive
 	contradictsNodeList := false
+	localEntries := 0
+	localMaster := true
 	for _, n := range st.Nodes {
-		if n.Name == st.Current && n.State != string(st.Role) {
-			contradictsNodeList = true
+		if n.Name == st.Current {
+			localEntries++
+			localMaster = localMaster && n.State == string(instancemanager.RoleMaster)
+			if n.State != string(st.Role) {
+				contradictsNodeList = true
+			}
 		}
 		if n.Name != st.Current && st.Role == instancemanager.RoleMaster && n.State == string(instancemanager.RoleMaster) {
 			contradictsNodeList = true
 		}
 	}
+	o.ActiveMasterClaim = st.Role == instancemanager.RoleMaster && st.ServerActive &&
+		st.Current != "" && localEntries == 1 && localMaster
 	o.Conflicting = notYetActive || contradictsNodeList
 	o.MasterNotYetActive = notYetActive && !contradictsNodeList
 	switch {
@@ -218,4 +238,21 @@ func observationFromStatus(st instancemanager.HAStatus, at time.Time) RoleObserv
 		o.Reason = "a master whose server is not registered_and_active"
 	}
 	return o
+}
+
+// unfinishedFromStatus turns the Instance Manager's report of an unfinished
+// database into the status form. A state other than WaitingForOperation is
+// taken as Refused: nothing is promised to take that database up.
+func unfinishedFromStatus(u *instancemanager.UnfinishedDatabase) *databasev1alpha1.InstanceUnfinishedDatabase {
+	if u == nil {
+		return nil
+	}
+	state := databasev1alpha1.UnfinishedRefused
+	if u.State == instancemanager.UnfinishedWaiting {
+		state = databasev1alpha1.UnfinishedWaitingForOperation
+	}
+	return &databasev1alpha1.InstanceUnfinishedDatabase{
+		Database: cleanMessage(u.Database), Operation: cleanMessage(u.Operation),
+		State: state, Message: cleanMessage(u.Reason),
+	}
 }

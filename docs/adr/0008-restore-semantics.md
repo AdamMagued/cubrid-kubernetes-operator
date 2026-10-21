@@ -108,14 +108,17 @@ and `..` or `.` segments were resolved first.
 
 The bucket and prefix a backup is written under follow the same rules, so the
 URI a `CubridBackup` reports (`status.artifact.uri`,
-`s3://<bucket>/<prefix>/<cluster-uid>/<database>/<backup-uid>/manifest.json`)
+`s3://<bucket>/<prefix>/<cluster-uid>/<database>/<backup-uid>/attempt-<upload-id>/manifest.json`)
 is one a recovery accepts (#437). The API server checks
 `spec.destination.objectStorage.bucket` and `prefix` of a `CubridBackup`: the
 bucket by the rules above, and a non-empty prefix as segments by the rules
 above, without a leading `/`, with at most one trailing `/` (left out of the
 key written), at most 1024 characters. A key is never rewritten to fit; a
-backup whose artifact URI would be longer than 1093 characters is not run
-(`InvalidBackupDestination`). `spec.objectStorage.bucket` and `prefix` of a
+backup whose artifact URI would be longer than 1093 characters, or whose
+manifest key exceeds 1024 bytes including the fresh attempt suffix, is not run
+(`InvalidBackupDestination`). The returned artifact URI selects an upload;
+consumers must not reconstruct it from the requested destination. Legacy URIs
+without the attempt component stay valid. `spec.objectStorage.bucket` and `prefix` of a
 `CubridCluster` are not restricted by these rules: they place the seed
 backups of an HA cluster (ADR-0010), which are restored by their bucket and
 prefix and never read through a `manifestUri`.
@@ -212,7 +215,10 @@ The restore command as implemented (#169, from POC-11 in
 guard, the artifact verification and the download, the Instance Manager
 creates `<CUBRID_DATABASES>/<db>`, adds the database to `databases.txt` in the
 form `createdb` writes (with the Pod's host name), and runs
-`cubrid restoredb -u -B <staged backup> <db>`. When `restoredb` fails it
+`cubrid restoredb -u -B <staged backup> <db>`; a member seeded from a
+running master (ADR-0010) is restored with
+`cubrid restoreslave -u -s master -m <source> -B <staged backup> <db>`
+instead (POC-14, `internal/instancemanager/restore.go`). When the command fails it
 removes that directory and puts `databases.txt` back as it was, so the target
 is empty again for a retry.
 
@@ -224,7 +230,11 @@ commands (ADR-0003), so for a standalone member it starts the server
 state `Starting`; the operation is `Completed` only when that succeeded, and a
 failed start leaves the restored data in place and the operation `Failed`.
 Deleting the Pod to let the entrypoint start it was rejected: it would make a
-restart the start mechanism. An HA member is started by the HA bootstrap.
+restart the start mechanism. For an HA member the restore operation starts
+heartbeat as its last step, under the start rules of ADR-0010: a member whose
+heartbeat already runs completes only in a confirmed role, and a start the
+manager issues completes when `cubrid heartbeat start` exits 0 (no role is
+checked after it).
 A member that is not standalone restores only when its HA configuration
 (`cubrid_ha.conf` with a usable `ha_node_list`) can be read, because the
 restored database is registered under that member list and joins HA; without
@@ -294,10 +304,43 @@ failed before its data was recorded, and so was never started, is removed and
 restored again. A seeding retry from the same source in the same round sends
 the same request body under its new key (the seed location names the source
 and the round, not the attempt), so it is the same request: it takes over the
-data the earlier attempt restored and only starts it, and the new seed backup
-that the retry took is not restored. A seeding retry from another source, or
-in another round, is a different request, so it is refused in the same way
-while the restored data of the earlier attempt is in place.
+data the earlier attempt restored and only starts it. The operator therefore
+takes no new seed backup for such a retry (#463): before the backup it looks
+up the restore of the latest earlier attempt under this step's key, and when
+that restore failed after it recorded this step's seed backup as restored,
+with the same request body (compared by the hash the Instance Manager keeps),
+the retry sends that request again without a backup. The key names the
+member and, for a later member, the source and the round, but a round counts
+only within one attempt: a failed attempt clears
+`status.databases[].seeding`, so the next attempt starts again at round 0,
+and an earlier attempt under the same key may have copied from the same
+source before a failover and back (ADR-0010). Once the retry's own restore
+exists under its key, only that key is looked up. In every other case, also
+when the earlier restore failed before it restored anything or there is
+none, the retry takes a new seed backup as before, at the same place, and its
+restore restores it. The first attempt looks nothing up. A lookup that fails
+keeps the step waiting and starts nothing, without using up an attempt: a
+peer that cannot be reached now also holds back the seed backup on the
+source, where it held back only the restore before, since that restore
+waited in the same way.
+
+The operator predicts the takeover from the earlier operation record; the
+Instance Manager decides by the ownership marker on the data. When the marker
+or the data was removed while the record stayed (for example by a person),
+the backup is skipped and the Instance Manager restores the backup that is at
+the seed location, which is the earlier attempt's: the member starts from an
+older point of the same source and may fail to catch up when the source no
+longer holds the logs since then. That is a risk to availability, not
+divergence, because the backup is of the same source. A download that then
+fails leaves a restore that restored nothing, so the next attempt takes a new
+backup; a member that restored the older backup and cannot catch up fails
+like any other start, under the attempt limit, and a bootstrap that keeps
+failing waits for a person. Closing the gap would take exposing the marker's
+owner through the operations API, or a field of the restore request that
+requires a takeover and that the request hash leaves out; neither is done.
+A seeding retry from another source, or in another round, is a different
+request, so it is refused in the same way while the restored data of the
+earlier attempt is in place.
 
 When the marker of a restore recorded `Completed` is still there (the
 operation was recorded, then the marker could not be removed), the entrypoint
@@ -338,6 +381,11 @@ The cluster is **not Ready** until ALL hold: manifest trust checks pass;
 restored DB opens under the expected DB name/version; the initial master
 is configured as the authoritative HA master; all required
 `promotableMembers` are seeded; slaves join HA and catch up (ADR-0006).
+As implemented, the recovery completes once the restore operation is
+`Completed` (manifest and checksums verified, the restore command and the
+start succeeded) and every other member is seeded and HA-configured; no
+step opens the database or checks its version, catch-up is not checked,
+and the `Validating` phase of the API is never set.
 Failed/partial restore → `Ready=False` + blocked/degraded condition;
 **never report a half-restored DB as healthy** and never advertise DB
 service from a partially restored pod.
@@ -391,7 +439,10 @@ bootstrap branch**: an existing DB is a hard block here, not an adoption.
 This guard covers the **initial master PVC**; slave PVC safety is
 delegated to the ADR-0006 seed/rebuild flow. Source `clusterUid` is
 verified for manifest integrity/presence and **recorded as provenance**,
-not required to equal the new cluster UID (restore-into-new-cluster).
+not required to equal the new cluster UID (restore-into-new-cluster); the
+backup must be full (`level` 0) and may come from a standby (#276). As
+implemented, it stays in `manifest.json`; the cluster's status records the
+`manifestUri`, not the source UID.
 
 ### Status
 
@@ -411,7 +462,13 @@ status:
     - { type: Ready, status: "False", reason: BootstrapRecoveryInProgress }  # BootstrapRecoveryFailed when state is Failed
 ```
 
-Open-ended reasons, consistent with prior ADRs.
+Open-ended reasons, consistent with prior ADRs. The example is the
+original proposal. As implemented, the fields are
+`status.bootstrap.{mode, phase, manifestUri, operationID, targetMember,
+attempts}` (`api/v1alpha1/cubridcluster_types.go`); there is no
+`status.phase` and no `RecoveryValidated` Condition, and the reasons of
+`BootstrapReady` and `Ready` are those of
+[docs/observability.md](../observability.md#conditions).
 
 ## Consequences
 

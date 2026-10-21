@@ -43,12 +43,18 @@ const ownershipMarker = ".im-operation"
 func markerPath(database string) string { return filepath.Join(database, ownershipMarker) }
 
 // markOwned records opID as the operation creating <targetDir>/<database>.
-// An empty opID (a caller without a durable operation) writes nothing.
+// An empty opID (a caller without a durable operation) writes nothing. The
+// marker is replaced whole and made durable together with the database
+// directory that holds it: a crash leaves the earlier owner or the new one,
+// never an unreadable marker or a directory without one.
 func markOwned(root *os.Root, database, opID string) error {
 	if opID == "" {
 		return nil
 	}
-	if err := root.WriteFile(markerPath(database), []byte(opID+"\n"), 0o600); err != nil {
+	if err := replaceFile(root, markerPath(database), []byte(opID+"\n")); err != nil {
+		return fmt.Errorf("mark %s as owned by %s: %w", database, opID, err)
+	}
+	if err := syncDir(root, filepath.Dir(database)); err != nil {
 		return fmt.Errorf("mark %s as owned by %s: %w", database, opID, err)
 	}
 	return nil
@@ -61,11 +67,119 @@ func clearOwned(targetDir, database string) error {
 		return err
 	}
 	defer func() { _ = root.Close() }()
-	if err := root.Remove(markerPath(database)); err != nil && !os.IsNotExist(err) {
+	if err := removeFile(root, markerPath(database)); err != nil {
 		return fmt.Errorf("clear the ownership marker of %s: %w", database, err)
 	}
 	return nil
 }
+
+// UnfinishedState says what becomes of a database that carries the
+// ownership marker.
+type UnfinishedState string
+
+const (
+	// UnfinishedWaiting: the marker names an operation of this manager that
+	// has ended, and whose leftover the next restore or HA bootstrap of the
+	// database clears or removes.
+	UnfinishedWaiting UnfinishedState = "WaitingForOperation"
+	// UnfinishedRefused: no operation of this manager removes or creates over
+	// the directory now. The marker names no operation, was written by the
+	// image's entrypoint, names an operation this manager does not know, or
+	// names a restore that recorded its data as restored; or the marker or
+	// the record cannot be read now, so the database cannot be judged.
+	UnfinishedRefused UnfinishedState = "Refused"
+)
+
+// UnfinishedDatabase is what the role answer reports of a database that
+// carries the ownership marker. The image's entrypoint neither creates nor
+// starts such a database.
+type UnfinishedDatabase struct {
+	Database string `json:"database"`
+	// Operation is the operation ID the marker names; empty when it names
+	// none.
+	Operation string          `json:"operation,omitempty"`
+	State     UnfinishedState `json:"state"`
+	// Reason says why the database is in State.
+	Reason string `json:"reason"`
+}
+
+// unfinishedDatabase reports the member's database when it carries the
+// ownership marker, judged as reclaimIncomplete judges it. It only reads: it
+// removes, clears, starts and writes nothing, also no operation record
+// (OperationStore.Peek). It is nil for a database without the marker, for a
+// marker of an operation that runs now, and for a member that was not told
+// its database.
+func (s *Server) unfinishedDatabase() *UnfinishedDatabase {
+	database := s.standaloneDB
+	if database == "" {
+		database = s.replicationDB
+	}
+	if !databaseNamePattern.MatchString(database) {
+		return nil
+	}
+	u := &UnfinishedDatabase{Database: database, State: UnfinishedRefused}
+	root, err := os.OpenRoot(s.restoreRoots.Target)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		u.Reason = fmt.Sprintf("the database root could not be opened, so the database cannot be judged now: %v", err)
+		return u
+	}
+	defer func() { _ = root.Close() }()
+	data, err := root.ReadFile(markerPath(database))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		u.Reason = fmt.Sprintf("the ownership marker could not be read, so the database cannot be judged now: %v", err)
+		return u
+	}
+	id := strings.TrimSpace(string(data))
+	switch {
+	case id == entrypointMarker:
+		u.Reason = "the image's entrypoint did not complete its createdb; no operation of the Instance Manager removes it"
+		return u
+	case !isValidOperationID(id):
+		u.Reason = "the ownership marker is unreadable: it names no operation"
+		return u
+	case s.store == nil:
+		u.Operation = id
+		u.Reason = "the marker names operation " + id + ", which this manager does not know: it has no operation store"
+		return u
+	}
+	u.Operation = id
+	// Peek, not Get: a read of the role writes no record.
+	op, err := s.store.Peek(id)
+	if errors.Is(err, ErrOperationNotFound) {
+		u.Reason = "the marker names operation " + id + ", which this manager does not know"
+		return u
+	}
+	if err != nil {
+		u.Reason = fmt.Sprintf("the record of operation %s could not be read, so the database cannot be judged now: %v", id, err)
+		return u
+	}
+	switch {
+	case !op.State.IsTerminal():
+		// The operation runs now and clears the marker when it completes;
+		// its own status reports it.
+		return nil
+	case op.State == OpCompleted:
+		u.State, u.Reason = UnfinishedWaiting,
+			"operation "+id+" completed and left its marker; the next restore or HA bootstrap of the database clears it"
+	case op.State == OpFailed && op.Restored != nil:
+		u.Reason = "operation " + id + " recorded its data as restored before it failed; " +
+			"only a restore of the same request takes it over, and no operation removes it"
+	default:
+		u.State, u.Reason = UnfinishedWaiting,
+			"operation "+id+" failed; the next restore or HA bootstrap of the database removes what it left"
+	}
+	return u
+}
+
+// entrypointMarker is the value the image's entrypoint writes into the
+// marker around its own createdb (build/instance-manager/entrypoint.sh).
+const entrypointMarker = "entrypoint-createdb"
 
 // reclaimIncomplete removes what an earlier, failed operation of this manager
 // left of database, so that the next attempt starts from an empty target. It
@@ -183,6 +297,14 @@ func (s *Server) adoptRestored(id, database string) (*OperationArtifact, error) 
 // unregisterDatabase removes database's line from databases.txt and leaves
 // every other line as it is.
 func unregisterDatabase(root *os.Root, database string) error {
+	databasesTxtMu.Lock()
+	defer databasesTxtMu.Unlock()
+	return unregisterDatabaseLocked(root, database, false)
+}
+
+// unregisterDatabaseLocked is unregisterDatabase with databasesTxtMu held.
+// With removeEmpty, a databases.txt that registers nothing else is removed.
+func unregisterDatabaseLocked(root *os.Root, database string, removeEmpty bool) error {
 	data, err := root.ReadFile(databasesTxt)
 	if os.IsNotExist(err) {
 		return nil
@@ -205,10 +327,16 @@ func unregisterDatabase(root *os.Root, database string) error {
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("read %s: %w", databasesTxt, err)
 	}
+	if removeEmpty && strings.TrimSpace(kept.String()) == "" {
+		if err := removeFile(root, databasesTxt); err != nil {
+			return fmt.Errorf("unregister %s from %s: %w", database, databasesTxt, err)
+		}
+		return nil
+	}
 	if !removed {
 		return nil
 	}
-	if err := root.WriteFile(databasesTxt, []byte(kept.String()), 0o600); err != nil {
+	if err := replaceFile(root, databasesTxt, []byte(kept.String())); err != nil {
 		return fmt.Errorf("unregister %s from %s: %w", database, databasesTxt, err)
 	}
 	return nil
