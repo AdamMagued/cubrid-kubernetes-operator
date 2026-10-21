@@ -953,11 +953,11 @@ spec:
         - spec
         type: object
         x-kubernetes-validations:
-        - message: metadata.name must be at most 53 characters and a DNS-1035 label
+        - message: metadata.name must be at most 52 characters and a DNS-1035 label
             (lowercase alphanumeric and hyphens, starting with a letter and ending
-            with an alphanumeric character) so generated child Service names fit within
-            Kubernetes 63-character limits
-          rule: '!has(self.metadata.name) || (self.metadata.name.size() <= 53 && self.metadata.name.matches(''^[a-z]([-a-z0-9]*[a-z0-9])?$''))'
+            with an alphanumeric character) so generated child names and labels fit
+            within Kubernetes 63-character limits
+          rule: '!has(self.metadata.name) || (self.metadata.name.size() <= 52 && self.metadata.name.matches(''^[a-z]([-a-z0-9]*[a-z0-9])?$''))'
     served: true
     storage: true
     subresources:

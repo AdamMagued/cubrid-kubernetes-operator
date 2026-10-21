@@ -148,10 +148,14 @@ ha_port_id=59901
 - The group id is the constant `cubrid`, the value the POC clusters formed
   with. Members of different clusters are told apart by their host names.
 - The hosts are the short pod names in ordinal order, each validated as a
-  DNS-1123 label. Cluster names are constrained to at most 53 characters
-  (DNS-1035 label) so generated child Service names (<cluster>-instances)
-  remain within the Kubernetes 63-character limit; a cluster name longer
-  than 53 characters is rejected.
+  DNS-1123 label. Cluster names are constrained to at most 52 characters
+  (DNS-1035 label) so every name and label value derived from them stays
+  within the Kubernetes 63-character limit. The longest is the
+  `controller-revision-hash` label the StatefulSet controller puts on each
+  DB Pod, `<cluster>-<hash>` with a hash of up to 10 characters; the
+  governing Service `<cluster>-instances` and the Broker Deployments
+  `<cluster>-broker-rw`/`-ro` follow. A cluster name longer than 52
+  characters is rejected on create.
 - `ha_db_list` keeps the order of `spec.databases` (ADR-0010).
 - `ha_port_id` is the CUBRID default, written explicitly because the
   heartbeat port is part of the network contract between members.

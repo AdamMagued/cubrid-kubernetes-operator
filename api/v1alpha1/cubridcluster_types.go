@@ -672,7 +672,7 @@ type BootstrapStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// +kubebuilder:validation:XValidation:rule="!has(self.metadata.name) || (self.metadata.name.size() <= 53 && self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$'))",message="metadata.name must be at most 53 characters and a DNS-1035 label (lowercase alphanumeric and hyphens, starting with a letter and ending with an alphanumeric character) so generated child Service names fit within Kubernetes 63-character limits"
+// +kubebuilder:validation:XValidation:rule="!has(self.metadata.name) || (self.metadata.name.size() <= 52 && self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$'))",message="metadata.name must be at most 52 characters and a DNS-1035 label (lowercase alphanumeric and hyphens, starting with a letter and ending with an alphanumeric character) so generated child names and labels fit within Kubernetes 63-character limits"
 // CubridCluster is the Schema for the cubridclusters API.
 type CubridCluster struct {
 	metav1.TypeMeta `json:",inline"`
@@ -708,22 +708,24 @@ func init() {
 
 const (
 	// MaxClusterNameLength is the maximum allowed length of a CubridCluster name.
-	// Constrained to 53 characters because the governing headless Service (<cluster>-instances)
-	// has a 10-character suffix and must not exceed Kubernetes' 63-character RFC 1035 limit.
-	MaxClusterNameLength = 53
+	// The longest value derived from it is the controller-revision-hash label the
+	// StatefulSet controller puts on each DB Pod, <cluster>-<hash of up to 10
+	// characters>, which must fit in Kubernetes' 63-character label value limit.
+	MaxClusterNameLength = 52
 
 	// ErrDNS1035Label is the validation error message when a cluster name is not a valid DNS-1035 label.
 	ErrDNS1035Label = "not a valid DNS-1035 label"
 )
 
-// ValidateClusterName validates that a cluster name conforms to the Kubernetes Service name
-// limits (RFC 1035 DNS label, max 53 characters so <cluster>-instances fits in 63 characters).
+// ValidateClusterName validates that a cluster name is an RFC 1035 DNS label of at most
+// MaxClusterNameLength characters, so every name and label value derived from it fits in
+// 63 characters.
 func ValidateClusterName(name string) error {
 	if len(name) == 0 {
 		return fmt.Errorf("cluster name cannot be empty")
 	}
 	if len(name) > MaxClusterNameLength {
-		return fmt.Errorf("cluster name %q length %d exceeds maximum allowed length of %d characters: generated child Service names cannot exceed 63 characters", name, len(name), MaxClusterNameLength)
+		return fmt.Errorf("cluster name %q length %d exceeds maximum allowed length of %d characters: generated child names and labels cannot exceed 63 characters", name, len(name), MaxClusterNameLength)
 	}
 	if errs := validation.IsDNS1035Label(name); len(errs) > 0 {
 		return fmt.Errorf("cluster name %q is %s: %s", name, ErrDNS1035Label, strings.Join(errs, "; "))

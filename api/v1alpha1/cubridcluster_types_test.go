@@ -39,8 +39,8 @@ func TestValidateClusterName(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "valid 53-character boundary name",
-			cluster: strings.Repeat("a", 53),
+			name:    "valid 52-character boundary name",
+			cluster: strings.Repeat("a", 52),
 			wantErr: false,
 		},
 		{
@@ -50,16 +50,16 @@ func TestValidateClusterName(t *testing.T) {
 			errMsg:  "cluster name cannot be empty",
 		},
 		{
-			name:    "54-character name rejected",
-			cluster: strings.Repeat("a", 54),
+			name:    "53-character name rejected",
+			cluster: strings.Repeat("a", 53),
 			wantErr: true,
-			errMsg:  "exceeds maximum allowed length of 53 characters",
+			errMsg:  "exceeds maximum allowed length of 52 characters",
 		},
 		{
 			name:    "61-character name rejected",
 			cluster: strings.Repeat("a", 61),
 			wantErr: true,
-			errMsg:  "exceeds maximum allowed length of 53 characters",
+			errMsg:  "exceeds maximum allowed length of 52 characters",
 		},
 		{
 			name:    "name with dots rejected",
